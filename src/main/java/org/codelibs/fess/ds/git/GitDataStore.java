@@ -16,6 +16,7 @@
 package org.codelibs.fess.ds.git;
 
 import java.io.ByteArrayInputStream;
+import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -48,6 +49,7 @@ import org.eclipse.jgit.internal.storage.dfs.InMemoryRepository;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.ObjectStream;
+import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevTree;
 import org.eclipse.jgit.revwalk.RevWalk;
@@ -62,19 +64,27 @@ public class GitDataStore extends AbstractDataStore {
 
     private static final Logger logger = LoggerFactory.getLogger(GitDataStore.class);
 
-    private static final String PASSWORD = "password";
+    protected static final String PASSWORD = "password";
 
-    private static final String USERNAME = "username";
+    protected static final String USERNAME = "username";
 
-    private static final String COMMIT_ID = "commit_id";
+    protected static final String COMMIT_ID = "commit_id";
 
-    private static final String REF_SPECS = "ref_specs";
+    protected static final String REF_SPECS = "ref_specs";
 
-    private static final String DEFAULT_EXTRACTOR = "default_extractor";
+    protected static final String DEFAULT_EXTRACTOR = "default_extractor";
 
-    private static final String CACHE_THRESHOLD = "cache_threshold";
+    protected static final String CACHE_THRESHOLD = "cache_threshold";
 
-    private static final String EXTRACTORS = "extractors";
+    protected static final String EXTRACTORS = "extractors";
+
+    protected static final String READ_INTERVAL = "read_interval";
+
+    protected static final String TREE_WALK = "tree_walk";
+
+    protected static final String REPOSITORY = "repository";
+
+    protected static final String URI = "uri";
 
     @Override
     protected String getName() {
@@ -84,8 +94,7 @@ public class GitDataStore extends AbstractDataStore {
     @Override
     protected void storeData(final DataConfig dataConfig, final IndexUpdateCallback callback, final Map<String, String> paramMap,
             final Map<String, String> scriptMap, final Map<String, Object> defaultDataMap) {
-        final long readInterval = getReadInterval(paramMap);
-        final String uri = paramMap.get("uri");
+        final String uri = paramMap.get(URI);
         if (StringUtil.isBlank(uri)) {
             throw new DataStoreException("uri is required.");
         }
@@ -99,10 +108,12 @@ public class GitDataStore extends AbstractDataStore {
         }
 
         final Map<String, Object> configMap = createConfigMap(paramMap);
+        configMap.put(URI, uri);
 
         logger.info("Git: {}", uri);
         final InMemoryRepository repo = new InMemoryRepository(new DfsRepositoryDescription());
         try (final Git git = new Git(repo)) {
+            configMap.put(REPOSITORY, repo);
             git.fetch().setRemote(uri).setRefSpecs(new RefSpec(refSpec)).setCredentialsProvider(credentialsProvider).call();
             final ObjectId lastCommitId = repo.resolve(commitId);
             try (RevWalk revWalk = new RevWalk(repo)) {
@@ -113,119 +124,133 @@ public class GitDataStore extends AbstractDataStore {
                     treeWalk.setRecursive(true);
                     boolean running = true;
                     while (treeWalk.next() && running) {
-                        final String name = treeWalk.getNameString();
-                        final String path = treeWalk.getPathString();
-                        logger.info("Crawling Path: {}", path);
-
+                        configMap.put(TREE_WALK, treeWalk);
                         final Map<String, Object> dataMap = new HashMap<>();
                         dataMap.putAll(defaultDataMap);
-                        final Map<String, Object> resultMap = new LinkedHashMap<>();
-                        resultMap.putAll(paramMap);
-                        try {
-                            final ObjectLoader objectLoader = repo.open(treeWalk.getObjectId(0));
-                            DeferredFileOutputStream dfos = null;
-                            try (ObjectStream in = objectLoader.openStream();
-                                    DeferredFileOutputStream out = new DeferredFileOutputStream((Integer) configMap.get(CACHE_THRESHOLD),
-                                            "fess-ds-git-", ".out", null)) {
-                                dfos = out;
-                                CopyUtil.copy(in, out);
-                                out.flush();
-
-                                final String mimeType = getMimeType(name, out);
-                                resultMap.put("mimetype", mimeType);
-                                final Extractor extractor = getExtractor(mimeType, configMap);
-
-                                final Map<String, String> params = new HashMap<>();
-                                params.put(TikaMetadataKeys.RESOURCE_NAME_KEY, name);
-                                try (ObjectStream os = objectLoader.openStream()) {
-                                    String content = extractor.getText(os, params).getContent();
-                                    if (content == null) {
-                                        content = StringUtil.EMPTY;
-                                    }
-                                    resultMap.put("content", content);
-                                    resultMap.put("contentLength", content.length());
-                                }
-                            } finally {
-                                if (dfos != null && !dfos.isInMemory()) {
-                                    if (!dfos.getFile().delete()) {
-                                        logger.warn("Failed to delete {}.", dfos.getFile().getAbsolutePath());
-                                    }
-                                }
-                            }
-
-                            resultMap.put("path", path);
-                            resultMap.put("attributes", treeWalk.getAttributes());
-                            resultMap.put("depth", treeWalk.getDepth());
-                            resultMap.put("fileMode", treeWalk.getFileMode());
-                            resultMap.put("name", name);
-                            resultMap.put("operationType", treeWalk.getOperationType());
-                            resultMap.put("pathLength", treeWalk.getPathLength());
-                            resultMap.put("treeCount", treeWalk.getTreeCount());
-                            resultMap.put("crawlingConfig", dataConfig);
-
-                            if (logger.isDebugEnabled()) {
-                                logger.debug("resultMap: {}", resultMap);
-                            }
-
-                            for (final Map.Entry<String, String> entry : scriptMap.entrySet()) {
-                                final Object convertValue = convertValue(entry.getValue(), resultMap);
-                                if (convertValue != null) {
-                                    dataMap.put(entry.getKey(), convertValue);
-                                }
-                            }
-                            if (logger.isDebugEnabled()) {
-                                logger.debug("dataMap: {}", dataMap);
-                            }
-
-                            callback.store(paramMap, dataMap);
-                        } catch (final CrawlingAccessException e) {
-                            logger.warn("Crawling Access Exception at : " + dataMap, e);
-
-                            Throwable target = e;
-                            if (target instanceof MultipleCrawlingAccessException) {
-                                final Throwable[] causes = ((MultipleCrawlingAccessException) target).getCauses();
-                                if (causes.length > 0) {
-                                    target = causes[causes.length - 1];
-                                }
-                            }
-
-                            String errorName;
-                            final Throwable cause = target.getCause();
-                            if (cause != null) {
-                                errorName = cause.getClass().getCanonicalName();
-                            } else {
-                                errorName = target.getClass().getCanonicalName();
-                            }
-
-                            String url;
-                            if (target instanceof DataStoreCrawlingException) {
-                                final DataStoreCrawlingException dce = (DataStoreCrawlingException) target;
-                                url = dce.getUrl();
-                                if (dce.aborted()) {
-                                    running = false;
-                                }
-                            } else {
-                                url = uri + ":" + path;
-                            }
-                            final FailureUrlService failureUrlService = ComponentUtil.getComponent(FailureUrlService.class);
-                            failureUrlService.store(dataConfig, errorName, url, target);
-                        } catch (final Throwable t) {
-                            logger.warn("Crawling Access Exception at : " + dataMap, t);
-                            final String url = uri + ":" + path;
-                            final FailureUrlService failureUrlService = ComponentUtil.getComponent(FailureUrlService.class);
-                            failureUrlService.store(dataConfig, t.getClass().getCanonicalName(), url, t);
-
-                            if (readInterval > 0) {
-                                sleep(readInterval);
-                            }
-
-                        }
+                        running = processFile(dataConfig, callback, paramMap, scriptMap, dataMap, configMap);
                     }
                 }
             }
         } catch (final Exception e) {
             throw new DataStoreException(e);
         }
+    }
+
+    private boolean processFile(final DataConfig dataConfig, final IndexUpdateCallback callback, final Map<String, String> paramMap,
+            final Map<String, String> scriptMap, final Map<String, Object> dataMap, final Map<String, Object> configMap) {
+        boolean running = true;
+        final String uri = (String) configMap.get(URI);
+        final Repository repo = (Repository) configMap.get(REPOSITORY);
+        final TreeWalk treeWalk = (TreeWalk) configMap.get(TREE_WALK);
+        final String name = treeWalk.getNameString();
+        final String path = treeWalk.getPathString();
+        logger.info("Crawling Path: {}", path);
+
+        final Map<String, Object> resultMap = new LinkedHashMap<>();
+        resultMap.putAll(paramMap);
+        try {
+            final ObjectLoader objectLoader = repo.open(treeWalk.getObjectId(0));
+            DeferredFileOutputStream dfos = null;
+            try (ObjectStream in = objectLoader.openStream();
+                    DeferredFileOutputStream out =
+                            new DeferredFileOutputStream((Integer) configMap.get(CACHE_THRESHOLD), "fess-ds-git-", ".out", null)) {
+                dfos = out;
+                CopyUtil.copy(in, out);
+                out.flush();
+
+                final String mimeType = getMimeType(name, out);
+                resultMap.put("mimetype", mimeType);
+                final Extractor extractor = getExtractor(mimeType, configMap);
+
+                final Map<String, String> params = new HashMap<>();
+                params.put(TikaMetadataKeys.RESOURCE_NAME_KEY, name);
+                try (ObjectStream os = objectLoader.openStream()) {
+                    String content = extractor.getText(os, params).getContent();
+                    if (content == null) {
+                        content = StringUtil.EMPTY;
+                    }
+                    resultMap.put("content", content);
+                    resultMap.put("contentLength", content.length());
+                }
+            } finally {
+                if (dfos != null && !dfos.isInMemory()) {
+                    final File file = dfos.getFile();
+                    if (!file.delete()) {
+                        logger.warn("Failed to delete {}.", file.getAbsolutePath());
+                    }
+                }
+            }
+
+            resultMap.put("uri", uri);
+            resultMap.put("path", path);
+            resultMap.put("attributes", treeWalk.getAttributes());
+            resultMap.put("depth", treeWalk.getDepth());
+            resultMap.put("fileMode", treeWalk.getFileMode());
+            resultMap.put("name", name);
+            resultMap.put("operationType", treeWalk.getOperationType());
+            resultMap.put("pathLength", treeWalk.getPathLength());
+            resultMap.put("treeCount", treeWalk.getTreeCount());
+            resultMap.put("crawlingConfig", dataConfig);
+
+            if (logger.isDebugEnabled()) {
+                logger.debug("resultMap: {}", resultMap);
+            }
+
+            for (final Map.Entry<String, String> entry : scriptMap.entrySet()) {
+                final Object convertValue = convertValue(entry.getValue(), resultMap);
+                if (convertValue != null) {
+                    dataMap.put(entry.getKey(), convertValue);
+                }
+            }
+            if (logger.isDebugEnabled()) {
+                logger.debug("dataMap: {}", dataMap);
+            }
+
+            callback.store(paramMap, dataMap);
+        } catch (final CrawlingAccessException e) {
+            logger.warn("Crawling Access Exception at : " + dataMap, e);
+
+            Throwable target = e;
+            if (target instanceof MultipleCrawlingAccessException) {
+                final Throwable[] causes = ((MultipleCrawlingAccessException) target).getCauses();
+                if (causes.length > 0) {
+                    target = causes[causes.length - 1];
+                }
+            }
+
+            String errorName;
+            final Throwable cause = target.getCause();
+            if (cause != null) {
+                errorName = cause.getClass().getCanonicalName();
+            } else {
+                errorName = target.getClass().getCanonicalName();
+            }
+
+            String url;
+            if (target instanceof DataStoreCrawlingException) {
+                final DataStoreCrawlingException dce = (DataStoreCrawlingException) target;
+                url = dce.getUrl();
+                if (dce.aborted()) {
+                    running = false;
+                }
+            } else {
+                url = uri + ":" + path;
+            }
+            final FailureUrlService failureUrlService = ComponentUtil.getComponent(FailureUrlService.class);
+            failureUrlService.store(dataConfig, errorName, url, target);
+        } catch (final Throwable t) {
+            logger.warn("Crawling Access Exception at : " + dataMap, t);
+            final String url = uri + ":" + path;
+            final FailureUrlService failureUrlService = ComponentUtil.getComponent(FailureUrlService.class);
+            failureUrlService.store(dataConfig, t.getClass().getCanonicalName(), url, t);
+
+            final long readInterval = (Long) configMap.get(READ_INTERVAL);
+            if (readInterval > 0) {
+                sleep(readInterval);
+            }
+
+        }
+        return running;
     }
 
     protected Map<String, Object> createConfigMap(final Map<String, String> paramMap) {
@@ -241,6 +266,8 @@ public class GitDataStore extends AbstractDataStore {
         configMap.put(EXTRACTORS, extractors);
         configMap.put(CACHE_THRESHOLD, Integer.parseInt(paramMap.getOrDefault(CACHE_THRESHOLD, "1000000")));
         configMap.put(DEFAULT_EXTRACTOR, paramMap.getOrDefault(DEFAULT_EXTRACTOR, "tikaExtractor"));
+        configMap.put(READ_INTERVAL, getReadInterval(paramMap));
+
         return configMap;
     }
 
