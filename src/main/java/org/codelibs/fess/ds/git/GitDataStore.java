@@ -15,11 +15,22 @@
  */
 package org.codelibs.fess.ds.git;
 
+import java.io.ByteArrayInputStream;
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
+import java.util.regex.Pattern;
 
+import org.apache.commons.io.output.DeferredFileOutputStream;
+import org.apache.tika.metadata.TikaMetadataKeys;
+import org.codelibs.core.io.CopyUtil;
+import org.codelibs.core.lang.StringUtil;
+import org.codelibs.core.misc.Pair;
+import org.codelibs.core.stream.StreamUtil;
 import org.codelibs.fess.app.service.FailureUrlService;
 import org.codelibs.fess.crawler.exception.CrawlingAccessException;
 import org.codelibs.fess.crawler.exception.MultipleCrawlingAccessException;
@@ -42,12 +53,17 @@ import org.eclipse.jgit.revwalk.RevTree;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.RefSpec;
 import org.eclipse.jgit.treewalk.TreeWalk;
-import org.jsoup.internal.StringUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class GitDataStore extends AbstractDataStore {
     private static final Logger logger = LoggerFactory.getLogger(GitDataStore.class);
+
+    private static final String DEFAULT_EXTRACTOR = "default_extractor";
+
+    private static final String CACHE_THRESHOLD = "cache_threshold";
+
+    private static final String EXTRACTORS = "extractors";
 
     @Override
     protected String getName() {
@@ -64,6 +80,8 @@ public class GitDataStore extends AbstractDataStore {
         }
         final String refSpec = paramMap.getOrDefault("ref_specs", "+refs/heads/*:refs/heads/*");
         final String commitId = paramMap.getOrDefault("commit_id", "refs/heads/master");
+
+        final Map<String, Object> configMap = createConfigMap(paramMap);
 
         logger.info("Git: {}", uri);
         final InMemoryRepository repo = new InMemoryRepository(new DfsRepositoryDescription());
@@ -83,11 +101,41 @@ public class GitDataStore extends AbstractDataStore {
                         logger.info("Crawling Path: {}", path);
 
                         final Map<String, Object> dataMap = new HashMap<>();
+                        dataMap.putAll(defaultDataMap);
+                        final Map<String, Object> resultMap = new LinkedHashMap<>();
+                        resultMap.putAll(paramMap);
                         try {
-                            final String content = getContent(name, repo.open(treeWalk.getObjectId(0)));
-                            dataMap.putAll(defaultDataMap);
-                            final Map<String, Object> resultMap = new LinkedHashMap<>();
-                            resultMap.putAll(paramMap);
+                            ObjectLoader objectLoader = repo.open(treeWalk.getObjectId(0));
+                            DeferredFileOutputStream dfos = null;
+                            try (ObjectStream in = objectLoader.openStream();
+                                    DeferredFileOutputStream out = new DeferredFileOutputStream((Integer) configMap.get(CACHE_THRESHOLD),
+                                            "fess-ds-git-", ".out", null)) {
+                                dfos = out;
+                                CopyUtil.copy(in, out);
+                                out.flush();
+
+                                String mimeType = getMimeType(name, out);
+                                resultMap.put("mimetype", mimeType);
+                                final Extractor extractor = getExtractor(mimeType, configMap);
+
+                                final Map<String, String> params = new HashMap<>();
+                                params.put(TikaMetadataKeys.RESOURCE_NAME_KEY, name);
+                                try (ObjectStream os = objectLoader.openStream()) {
+                                    String content = extractor.getText(os, params).getContent();
+                                    if (content == null) {
+                                        content = StringUtil.EMPTY;
+                                    }
+                                    resultMap.put("content", content);
+                                    resultMap.put("contentLength", content.length());
+                                }
+                            } finally {
+                                if (dfos != null && !dfos.isInMemory()) {
+                                    if (!dfos.getFile().delete()) {
+                                        logger.warn("Failed to delete {}.", dfos.getFile().getAbsolutePath());
+                                    }
+                                }
+                            }
+
                             resultMap.put("path", path);
                             resultMap.put("attributes", treeWalk.getAttributes());
                             resultMap.put("depth", treeWalk.getDepth());
@@ -97,8 +145,6 @@ public class GitDataStore extends AbstractDataStore {
                             resultMap.put("pathLength", treeWalk.getPathLength());
                             resultMap.put("treeCount", treeWalk.getTreeCount());
                             resultMap.put("crawlingConfig", dataConfig);
-                            resultMap.put("content", content);
-                            resultMap.put("contentLength", content.length());
 
                             if (logger.isDebugEnabled()) {
                                 logger.debug("resultMap: {}", resultMap);
@@ -165,24 +211,62 @@ public class GitDataStore extends AbstractDataStore {
         }
     }
 
-    protected String getContent(final String name, final ObjectLoader objectLoader) throws IOException {
-        final String mimeType = getMimeType(name, objectLoader);
+    protected Map<String, Object> createConfigMap(final Map<String, String> paramMap) {
+        final Map<String, Object> configMap = new HashMap<>();
+        @SuppressWarnings("unchecked")
+        final Pair<Pattern, String>[] extractors = StreamUtil.split(paramMap.get(EXTRACTORS), ",").get(stream -> stream.map(s -> {
+            final String[] values = s.split(":");
+            if (values.length != 2) {
+                return null;
+            }
+            return new Pair<>(Pattern.compile(values[0]), values[1]);
+        }).filter(Objects::nonNull).toArray(n -> new Pair[n]));
+        configMap.put(EXTRACTORS, extractors);
+        configMap.put(CACHE_THRESHOLD, Integer.parseInt(paramMap.getOrDefault(CACHE_THRESHOLD, "1000000")));
+        configMap.put(DEFAULT_EXTRACTOR, paramMap.getOrDefault(DEFAULT_EXTRACTOR, "tikaExtractor"));
+        return configMap;
+    }
+
+    protected Extractor getExtractor(final String mimeType, final Map<String, Object> configMap) {
+        @SuppressWarnings("unchecked")
+        final Pair<Pattern, String>[] extractors = (Pair<Pattern, String>[]) configMap.get(EXTRACTORS);
+        for (final Pair<Pattern, String> pair : extractors) {
+            if (pair.getFirst().matcher(mimeType).matches()) {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("use {} from {}", pair.getSecond(), mimeType);
+                }
+                final Extractor extractor = ComponentUtil.getComponent(pair.getSecond());
+                if (extractor != null) {
+                    return extractor;
+                }
+            }
+        }
+        if (logger.isDebugEnabled()) {
+            logger.debug("use a default extractor from {}", mimeType);
+        }
         Extractor extractor = ComponentUtil.getExtractorFactory().getExtractor(mimeType);
         if (extractor == null) {
             if (logger.isDebugEnabled()) {
                 logger.debug("use a defautl extractor as tikaExtractor by {}", mimeType);
             }
-            extractor = ComponentUtil.getComponent("tikaExtractor");
+            extractor = ComponentUtil.getComponent((String) configMap.get(DEFAULT_EXTRACTOR));
         }
-        try (ObjectStream os = objectLoader.openStream()) {
-            return extractor.getText(os, null).getContent();
+        return extractor;
+    }
+
+    protected String getMimeType(final String filename, final DeferredFileOutputStream out) throws IOException {
+        final MimeTypeHelper mimeTypeHelper = ComponentUtil.getComponent(MimeTypeHelper.class);
+        try (InputStream is = getContentInputStream(out)) {
+            return mimeTypeHelper.getContentType(is, filename);
         }
     }
 
-    protected String getMimeType(final String name, final ObjectLoader objectLoader) throws IOException {
-        final MimeTypeHelper mimeTypeHelper = ComponentUtil.getComponent(MimeTypeHelper.class);
-        try (ObjectStream os = objectLoader.openStream()) {
-            return mimeTypeHelper.getContentType(os, name);
+    protected InputStream getContentInputStream(final DeferredFileOutputStream out) throws IOException {
+        if (out.isInMemory()) {
+            return new ByteArrayInputStream(out.getData());
+        } else {
+            return new FileInputStream(out.getFile());
         }
     }
+
 }
