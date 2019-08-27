@@ -51,13 +51,24 @@ import org.eclipse.jgit.lib.ObjectStream;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.revwalk.RevTree;
 import org.eclipse.jgit.revwalk.RevWalk;
+import org.eclipse.jgit.transport.CredentialsProvider;
 import org.eclipse.jgit.transport.RefSpec;
+import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 import org.eclipse.jgit.treewalk.TreeWalk;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class GitDataStore extends AbstractDataStore {
+
     private static final Logger logger = LoggerFactory.getLogger(GitDataStore.class);
+
+    private static final String PASSWORD = "password";
+
+    private static final String USERNAME = "username";
+
+    private static final String COMMIT_ID = "commit_id";
+
+    private static final String REF_SPECS = "ref_specs";
 
     private static final String DEFAULT_EXTRACTOR = "default_extractor";
 
@@ -78,15 +89,21 @@ public class GitDataStore extends AbstractDataStore {
         if (StringUtil.isBlank(uri)) {
             throw new DataStoreException("uri is required.");
         }
-        final String refSpec = paramMap.getOrDefault("ref_specs", "+refs/heads/*:refs/heads/*");
-        final String commitId = paramMap.getOrDefault("commit_id", "refs/heads/master");
+        final String refSpec = paramMap.getOrDefault(REF_SPECS, "+refs/heads/*:refs/heads/*");
+        final String commitId = paramMap.getOrDefault(COMMIT_ID, "refs/heads/master");
+        final String username = paramMap.get(USERNAME);
+        final String password = paramMap.get(PASSWORD);
+        CredentialsProvider credentialsProvider = null;
+        if (username != null && password != null) {
+            credentialsProvider = new UsernamePasswordCredentialsProvider(username, password);
+        }
 
         final Map<String, Object> configMap = createConfigMap(paramMap);
 
         logger.info("Git: {}", uri);
         final InMemoryRepository repo = new InMemoryRepository(new DfsRepositoryDescription());
         try (final Git git = new Git(repo)) {
-            git.fetch().setRemote(uri).setRefSpecs(new RefSpec(refSpec)).call();
+            git.fetch().setRemote(uri).setRefSpecs(new RefSpec(refSpec)).setCredentialsProvider(credentialsProvider).call();
             final ObjectId lastCommitId = repo.resolve(commitId);
             try (RevWalk revWalk = new RevWalk(repo)) {
                 final RevCommit commit = revWalk.parseCommit(lastCommitId);
@@ -105,7 +122,7 @@ public class GitDataStore extends AbstractDataStore {
                         final Map<String, Object> resultMap = new LinkedHashMap<>();
                         resultMap.putAll(paramMap);
                         try {
-                            ObjectLoader objectLoader = repo.open(treeWalk.getObjectId(0));
+                            final ObjectLoader objectLoader = repo.open(treeWalk.getObjectId(0));
                             DeferredFileOutputStream dfos = null;
                             try (ObjectStream in = objectLoader.openStream();
                                     DeferredFileOutputStream out = new DeferredFileOutputStream((Integer) configMap.get(CACHE_THRESHOLD),
@@ -114,7 +131,7 @@ public class GitDataStore extends AbstractDataStore {
                                 CopyUtil.copy(in, out);
                                 out.flush();
 
-                                String mimeType = getMimeType(name, out);
+                                final String mimeType = getMimeType(name, out);
                                 resultMap.put("mimetype", mimeType);
                                 final Extractor extractor = getExtractor(mimeType, configMap);
 
