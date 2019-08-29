@@ -20,6 +20,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -82,9 +83,13 @@ public class GitDataStore extends AbstractDataStore {
 
     protected static final String TREE_WALK = "tree_walk";
 
+    protected static final String REV_COMMIT = "rev_commit";
+
     protected static final String REPOSITORY = "repository";
 
     protected static final String URI = "uri";
+
+    protected static final String BASE_URL = "base_url";
 
     @Override
     protected String getName() {
@@ -112,19 +117,20 @@ public class GitDataStore extends AbstractDataStore {
 
         logger.info("Git: {}", uri);
         final InMemoryRepository repo = new InMemoryRepository(new DfsRepositoryDescription());
+        configMap.put(REPOSITORY, repo);
         try (final Git git = new Git(repo)) {
-            configMap.put(REPOSITORY, repo);
             git.fetch().setRemote(uri).setRefSpecs(new RefSpec(refSpec)).setCredentialsProvider(credentialsProvider).call();
             final ObjectId lastCommitId = repo.resolve(commitId);
             try (RevWalk revWalk = new RevWalk(repo)) {
                 final RevCommit commit = revWalk.parseCommit(lastCommitId);
+                configMap.put(REV_COMMIT, commit);
                 final RevTree tree = commit.getTree();
                 try (TreeWalk treeWalk = new TreeWalk(repo)) {
+                    configMap.put(TREE_WALK, treeWalk);
                     treeWalk.addTree(tree);
                     treeWalk.setRecursive(true);
                     boolean running = true;
                     while (treeWalk.next() && running) {
-                        configMap.put(TREE_WALK, treeWalk);
                         final Map<String, Object> dataMap = new HashMap<>();
                         dataMap.putAll(defaultDataMap);
                         running = processFile(dataConfig, callback, paramMap, scriptMap, dataMap, configMap);
@@ -136,11 +142,12 @@ public class GitDataStore extends AbstractDataStore {
         }
     }
 
-    private boolean processFile(final DataConfig dataConfig, final IndexUpdateCallback callback, final Map<String, String> paramMap,
+    protected boolean processFile(final DataConfig dataConfig, final IndexUpdateCallback callback, final Map<String, String> paramMap,
             final Map<String, String> scriptMap, final Map<String, Object> dataMap, final Map<String, Object> configMap) {
         boolean running = true;
         final String uri = (String) configMap.get(URI);
         final Repository repo = (Repository) configMap.get(REPOSITORY);
+        final RevCommit revCommit = (RevCommit) configMap.get(REV_COMMIT);
         final TreeWalk treeWalk = (TreeWalk) configMap.get(TREE_WALK);
         final String name = treeWalk.getNameString();
         final String path = treeWalk.getPathString();
@@ -181,6 +188,7 @@ public class GitDataStore extends AbstractDataStore {
                 }
             }
 
+            resultMap.put("url", BASE_URL + path);
             resultMap.put("uri", uri);
             resultMap.put("path", path);
             resultMap.put("attributes", treeWalk.getAttributes());
@@ -191,6 +199,9 @@ public class GitDataStore extends AbstractDataStore {
             resultMap.put("pathLength", treeWalk.getPathLength());
             resultMap.put("treeCount", treeWalk.getTreeCount());
             resultMap.put("crawlingConfig", dataConfig);
+            resultMap.put("author", revCommit.getAuthorIdent());
+            resultMap.put("committer", revCommit.getCommitterIdent());
+            resultMap.put("timestamp", new Date(revCommit.getCommitTime() * 1000L));
 
             if (logger.isDebugEnabled()) {
                 logger.debug("resultMap: {}", resultMap);
@@ -264,6 +275,7 @@ public class GitDataStore extends AbstractDataStore {
             return new Pair<>(Pattern.compile(values[0]), values[1]);
         }).filter(Objects::nonNull).toArray(n -> new Pair[n]));
         configMap.put(EXTRACTORS, extractors);
+        configMap.put(BASE_URL, paramMap.getOrDefault(BASE_URL, StringUtil.EMPTY));
         configMap.put(CACHE_THRESHOLD, Integer.parseInt(paramMap.getOrDefault(CACHE_THRESHOLD, "1000000")));
         configMap.put(DEFAULT_EXTRACTOR, paramMap.getOrDefault(DEFAULT_EXTRACTOR, "tikaExtractor"));
         configMap.put(READ_INTERVAL, getReadInterval(paramMap));

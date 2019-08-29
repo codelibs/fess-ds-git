@@ -33,10 +33,10 @@ site="github.com/codelibs/fess/" + path
 title=name
 content=content
 cache=""
-digest=""
+digest=author.toExternalString()
 anchor=
 content_length=contentLength
-last_modified=new java.util.Date()
+last_modified=timestamp
 mimetype=mimetype
 ```
 
