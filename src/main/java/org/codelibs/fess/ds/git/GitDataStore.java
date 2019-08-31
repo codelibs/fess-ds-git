@@ -20,12 +20,18 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.apache.commons.io.output.DeferredFileOutputStream;
 import org.apache.tika.metadata.TikaMetadataKeys;
@@ -35,29 +41,32 @@ import org.codelibs.core.misc.Pair;
 import org.codelibs.core.stream.StreamUtil;
 import org.codelibs.fess.app.service.FailureUrlService;
 import org.codelibs.fess.crawler.exception.CrawlingAccessException;
+import org.codelibs.fess.crawler.exception.MaxLengthExceededException;
 import org.codelibs.fess.crawler.exception.MultipleCrawlingAccessException;
 import org.codelibs.fess.crawler.extractor.Extractor;
 import org.codelibs.fess.crawler.helper.MimeTypeHelper;
 import org.codelibs.fess.ds.AbstractDataStore;
 import org.codelibs.fess.ds.callback.IndexUpdateCallback;
+import org.codelibs.fess.es.config.exbhv.DataConfigBhv;
 import org.codelibs.fess.es.config.exentity.DataConfig;
 import org.codelibs.fess.exception.DataStoreCrawlingException;
 import org.codelibs.fess.exception.DataStoreException;
 import org.codelibs.fess.util.ComponentUtil;
 import org.eclipse.jgit.api.Git;
-import org.eclipse.jgit.internal.storage.dfs.DfsRepositoryDescription;
-import org.eclipse.jgit.internal.storage.dfs.InMemoryRepository;
+import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.diff.DiffEntry;
+import org.eclipse.jgit.diff.DiffFormatter;
+import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.ObjectStream;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
-import org.eclipse.jgit.revwalk.RevTree;
-import org.eclipse.jgit.revwalk.RevWalk;
+import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 import org.eclipse.jgit.transport.CredentialsProvider;
+import org.eclipse.jgit.transport.FetchResult;
 import org.eclipse.jgit.transport.RefSpec;
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
-import org.eclipse.jgit.treewalk.TreeWalk;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -91,6 +100,20 @@ public class GitDataStore extends AbstractDataStore {
 
     protected static final String BASE_URL = "base_url";
 
+    protected static final String DIFF_ENTRY = "diff_entry";
+
+    protected static final String GIT = "git";
+
+    protected static final String CURRENT_COMMIT_ID = "current_commit_id";
+
+    protected static final String PREV_COMMIT_ID = "prev_commit_id";
+
+    protected static final String TEMP_REPOSITORY_PATH = "temp_repository_path";
+
+    protected static final String REPOSITORY_PATH = "repository_path";
+
+    protected static final String MAX_SIZE = "max_size";
+
     @Override
     protected String getName() {
         return this.getClass().getSimpleName();
@@ -104,9 +127,12 @@ public class GitDataStore extends AbstractDataStore {
             throw new DataStoreException("uri is required.");
         }
         final String refSpec = paramMap.getOrDefault(REF_SPECS, "+refs/heads/*:refs/heads/*");
-        final String commitId = paramMap.getOrDefault(COMMIT_ID, "refs/heads/master");
+        final String commitId = paramMap.getOrDefault(COMMIT_ID, Constants.HEAD);
         final String username = paramMap.get(USERNAME);
         final String password = paramMap.get(PASSWORD);
+        final String prevCommit = paramMap.get(PREV_COMMIT_ID);
+        final boolean isUpdateCommitId = prevCommit != null;
+        final String baseUrl = paramMap.get(BASE_URL);
         CredentialsProvider credentialsProvider = null;
         if (username != null && password != null) {
             credentialsProvider = new UsernamePasswordCredentialsProvider(username, password);
@@ -116,47 +142,113 @@ public class GitDataStore extends AbstractDataStore {
         configMap.put(URI, uri);
 
         logger.info("Git: {}", uri);
-        final InMemoryRepository repo = new InMemoryRepository(new DfsRepositoryDescription());
-        configMap.put(REPOSITORY, repo);
-        try (final Git git = new Git(repo)) {
-            git.fetch().setRemote(uri).setRefSpecs(new RefSpec(refSpec)).setCredentialsProvider(credentialsProvider).call();
-            final ObjectId lastCommitId = repo.resolve(commitId);
-            try (RevWalk revWalk = new RevWalk(repo)) {
-                final RevCommit commit = revWalk.parseCommit(lastCommitId);
-                configMap.put(REV_COMMIT, commit);
-                final RevTree tree = commit.getTree();
-                try (TreeWalk treeWalk = new TreeWalk(repo)) {
-                    configMap.put(TREE_WALK, treeWalk);
-                    treeWalk.addTree(tree);
-                    treeWalk.setRecursive(true);
-                    boolean running = true;
-                    while (treeWalk.next() && running) {
-                        final Map<String, Object> dataMap = new HashMap<>();
-                        dataMap.putAll(defaultDataMap);
-                        running = processFile(dataConfig, callback, paramMap, scriptMap, dataMap, configMap);
+
+        final Repository repository = (Repository) configMap.get(REPOSITORY);
+        configMap.put(REPOSITORY, repository);
+        try (final Git git = new Git(repository)) {
+            configMap.put(GIT, git);
+            final FetchResult fetchResult = git.fetch().setForceUpdate(true).setRemote(uri).setRefSpecs(new RefSpec(refSpec))
+                    .setCredentialsProvider(credentialsProvider).call();
+            if (logger.isDebugEnabled()) {
+                logger.debug("Fetch Result: {}", fetchResult.getMessages());
+            }
+            final ObjectId fromCommitId;
+            if (StringUtil.isNotBlank(prevCommit)) {
+                fromCommitId = repository.resolve(prevCommit);
+            } else {
+                fromCommitId = null;
+            }
+            final ObjectId toCommitId = repository.resolve(commitId);
+            configMap.put(CURRENT_COMMIT_ID, toCommitId);
+            try (DiffFormatter diffFormatter = new DiffFormatter(null)) {
+                diffFormatter.setRepository(repository);
+                diffFormatter.scan(fromCommitId, toCommitId).forEach(entry -> {
+                    configMap.put(DIFF_ENTRY, entry);
+                    switch (entry.getChangeType()) {
+                    case ADD:
+                    case MODIFY:
+                        processFile(dataConfig, callback, paramMap, scriptMap, defaultDataMap, configMap);
+                        break;
+                    case DELETE:
+                        if (StringUtil.isNotBlank(baseUrl)) {
+                            // TODO delete
+                        }
+                        break;
+                    case RENAME:
+                        if (StringUtil.isNotBlank(baseUrl)) {
+                            // TODO delete
+                        }
+                        processFile(dataConfig, callback, paramMap, scriptMap, defaultDataMap, configMap);
+                        break;
+                    default:
+                        break;
                     }
-                }
+                });
+            }
+            if (isUpdateCommitId) {
+                updateDataConfig(dataConfig, toCommitId);
             }
         } catch (final Exception e) {
             throw new DataStoreException(e);
+        } finally {
+            final File gitRepoPath = (File) configMap.get(TEMP_REPOSITORY_PATH);
+            if (gitRepoPath != null) {
+                try (Stream<Path> walk = Files.walk(gitRepoPath.toPath())) {
+                    walk.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
+                } catch (final IOException e) {
+                    logger.warn("Failed to delete " + gitRepoPath.getAbsolutePath(), e);
+                }
+            }
         }
     }
 
-    protected boolean processFile(final DataConfig dataConfig, final IndexUpdateCallback callback, final Map<String, String> paramMap,
-            final Map<String, String> scriptMap, final Map<String, Object> dataMap, final Map<String, Object> configMap) {
-        boolean running = true;
-        final String uri = (String) configMap.get(URI);
-        final Repository repo = (Repository) configMap.get(REPOSITORY);
-        final RevCommit revCommit = (RevCommit) configMap.get(REV_COMMIT);
-        final TreeWalk treeWalk = (TreeWalk) configMap.get(TREE_WALK);
-        final String name = treeWalk.getNameString();
-        final String path = treeWalk.getPathString();
-        logger.info("Crawling Path: {}", path);
+    protected void updateDataConfig(final DataConfig dataConfig, final ObjectId toCommitId) {
+        final String paramStr = dataConfig.getHandlerParameterMap().entrySet().stream().map(e -> {
+            if (PREV_COMMIT_ID.equals(e.getKey())) {
+                return e.getKey() + "=" + toCommitId.name();
+            } else {
+                return e.getKey() + "=" + e.getValue();
+            }
+        }).collect(Collectors.joining("\n"));
+        dataConfig.setHandlerParameter(paramStr);
+        if (logger.isDebugEnabled()) {
+            logger.debug("Updating data config by {}.", paramStr);
+        }
+        ComponentUtil.getComponent(DataConfigBhv.class).update(dataConfig);
+        logger.info("Updated DataConfig: {}", dataConfig.getId());
+    }
 
-        final Map<String, Object> resultMap = new LinkedHashMap<>();
-        resultMap.putAll(paramMap);
+    protected String getFileName(final String path) {
+        final int pos = path.lastIndexOf('/');
+        if (pos == -1) {
+            return path;
+        }
+        return path.substring(pos + 1);
+    }
+
+    protected void processFile(final DataConfig dataConfig, final IndexUpdateCallback callback, final Map<String, String> paramMap,
+            final Map<String, String> scriptMap, final Map<String, Object> defaultDataMap, final Map<String, Object> configMap) {
+        final Map<String, Object> dataMap = new HashMap<>();
+        dataMap.putAll(defaultDataMap);
+        final String uri = (String) configMap.get(URI);
+        final DiffEntry diffEntry = (DiffEntry) configMap.get(DIFF_ENTRY);
+        final String path = diffEntry.getNewPath();
         try {
-            final ObjectLoader objectLoader = repo.open(treeWalk.getObjectId(0));
+            final RevCommit revCommit = getRevCommit(configMap, path);
+
+            final String name = getFileName(path);
+            logger.info("Crawling Path: {}", path);
+
+            final Map<String, Object> resultMap = new LinkedHashMap<>();
+            resultMap.putAll(paramMap);
+            final Repository repository = (Repository) configMap.get(REPOSITORY);
+            final ObjectLoader objectLoader = repository.open(diffEntry.getNewId().toObjectId());
+            final long size = objectLoader.getSize();
+            if (size > ((Long) configMap.get(MAX_SIZE)).longValue()) {
+                throw new MaxLengthExceededException(
+                        "The content length (" + size + " byte) is over " + configMap.get(MAX_SIZE) + " byte. The path is " + path);
+            }
+            resultMap.put("contentLength", size);
             DeferredFileOutputStream dfos = null;
             try (ObjectStream in = objectLoader.openStream();
                     DeferredFileOutputStream out =
@@ -171,14 +263,38 @@ public class GitDataStore extends AbstractDataStore {
 
                 final Map<String, String> params = new HashMap<>();
                 params.put(TikaMetadataKeys.RESOURCE_NAME_KEY, name);
-                try (ObjectStream os = objectLoader.openStream()) {
-                    String content = extractor.getText(os, params).getContent();
+                try (InputStream is = getContentInputStream(out)) {
+                    String content = extractor.getText(is, params).getContent();
                     if (content == null) {
                         content = StringUtil.EMPTY;
                     }
                     resultMap.put("content", content);
-                    resultMap.put("contentLength", content.length());
                 }
+
+                resultMap.put("url", getUrl(paramMap, path));
+                resultMap.put("uri", uri);
+                resultMap.put("path", path);
+                resultMap.put("name", name);
+                resultMap.put("crawlingConfig", dataConfig);
+                resultMap.put("author", revCommit.getAuthorIdent());
+                resultMap.put("committer", revCommit.getCommitterIdent());
+                resultMap.put("timestamp", new Date(revCommit.getCommitTime() * 1000L));
+
+                if (logger.isDebugEnabled()) {
+                    logger.debug("resultMap: {}", resultMap);
+                }
+
+                for (final Map.Entry<String, String> entry : scriptMap.entrySet()) {
+                    final Object convertValue = convertValue(entry.getValue(), resultMap);
+                    if (convertValue != null) {
+                        dataMap.put(entry.getKey(), convertValue);
+                    }
+                }
+                if (logger.isDebugEnabled()) {
+                    logger.debug("dataMap: {}", dataMap);
+                }
+
+                callback.store(paramMap, dataMap);
             } finally {
                 if (dfos != null && !dfos.isInMemory()) {
                     final File file = dfos.getFile();
@@ -187,37 +303,6 @@ public class GitDataStore extends AbstractDataStore {
                     }
                 }
             }
-
-            resultMap.put("url", BASE_URL + path);
-            resultMap.put("uri", uri);
-            resultMap.put("path", path);
-            resultMap.put("attributes", treeWalk.getAttributes());
-            resultMap.put("depth", treeWalk.getDepth());
-            resultMap.put("fileMode", treeWalk.getFileMode());
-            resultMap.put("name", name);
-            resultMap.put("operationType", treeWalk.getOperationType());
-            resultMap.put("pathLength", treeWalk.getPathLength());
-            resultMap.put("treeCount", treeWalk.getTreeCount());
-            resultMap.put("crawlingConfig", dataConfig);
-            resultMap.put("author", revCommit.getAuthorIdent());
-            resultMap.put("committer", revCommit.getCommitterIdent());
-            resultMap.put("timestamp", new Date(revCommit.getCommitTime() * 1000L));
-
-            if (logger.isDebugEnabled()) {
-                logger.debug("resultMap: {}", resultMap);
-            }
-
-            for (final Map.Entry<String, String> entry : scriptMap.entrySet()) {
-                final Object convertValue = convertValue(entry.getValue(), resultMap);
-                if (convertValue != null) {
-                    dataMap.put(entry.getKey(), convertValue);
-                }
-            }
-            if (logger.isDebugEnabled()) {
-                logger.debug("dataMap: {}", dataMap);
-            }
-
-            callback.store(paramMap, dataMap);
         } catch (final CrawlingAccessException e) {
             logger.warn("Crawling Access Exception at : " + dataMap, e);
 
@@ -242,7 +327,7 @@ public class GitDataStore extends AbstractDataStore {
                 final DataStoreCrawlingException dce = (DataStoreCrawlingException) target;
                 url = dce.getUrl();
                 if (dce.aborted()) {
-                    running = false;
+                    throw e;
                 }
             } else {
                 url = uri + ":" + path;
@@ -259,9 +344,24 @@ public class GitDataStore extends AbstractDataStore {
             if (readInterval > 0) {
                 sleep(readInterval);
             }
-
         }
-        return running;
+    }
+
+    protected RevCommit getRevCommit(final Map<String, Object> configMap, final String path) throws GitAPIException {
+        final Git git = (Git) configMap.get(GIT);
+        final Iterator<RevCommit> revCommitIter = git.log().addPath(path).setMaxCount(1).call().iterator();
+        if (!revCommitIter.hasNext()) {
+            throw new DataStoreException("Failed to parse git log for " + path);
+        }
+        return revCommitIter.next();
+    }
+
+    protected String getUrl(final Map<String, String> paramMap, final String path) {
+        final String baseUrl = paramMap.get(BASE_URL);
+        if (StringUtil.isNotBlank(baseUrl)) {
+            return baseUrl + path;
+        }
+        return StringUtil.EMPTY;
     }
 
     protected Map<String, Object> createConfigMap(final Map<String, String> paramMap) {
@@ -279,7 +379,32 @@ public class GitDataStore extends AbstractDataStore {
         configMap.put(CACHE_THRESHOLD, Integer.parseInt(paramMap.getOrDefault(CACHE_THRESHOLD, "1000000")));
         configMap.put(DEFAULT_EXTRACTOR, paramMap.getOrDefault(DEFAULT_EXTRACTOR, "tikaExtractor"));
         configMap.put(READ_INTERVAL, getReadInterval(paramMap));
+        final String maxSize = paramMap.get(MAX_SIZE);
+        configMap.put(MAX_SIZE, StringUtil.isNotBlank(maxSize) ? Long.parseLong(maxSize) : 10000000L);
 
+        final String repositoryPath = paramMap.get(REPOSITORY_PATH);
+        if (StringUtil.isBlank(repositoryPath)) {
+            try {
+                final File gitRepoPath = File.createTempFile("fess-ds-git-", "");
+                if (!gitRepoPath.delete()) {
+                    throw new DataStoreException("Could not delete temporary file " + gitRepoPath);
+                }
+                gitRepoPath.mkdirs();
+                final Repository repository = FileRepositoryBuilder.create(new File(gitRepoPath, ".git"));
+                repository.create();
+                configMap.put(REPOSITORY, repository);
+                configMap.put(TEMP_REPOSITORY_PATH, gitRepoPath);
+            } catch (final IOException e) {
+                throw new DataStoreException("Failed to create a repository.", e);
+            }
+        } else {
+            try {
+                final Repository repository = FileRepositoryBuilder.create(new File(repositoryPath, ".git"));
+                configMap.put(REPOSITORY, repository);
+            } catch (final IOException e) {
+                throw new DataStoreException("Failed to load " + repositoryPath, e);
+            }
+        }
         return configMap;
     }
 

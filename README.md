@@ -20,16 +20,19 @@ See [Plugin](https://fess.codelibs.org/13.3/admin/plugin-guide.html) page.
 Parameter:
 
 ```
-uri=https://github.com/codelibs/fess.git
+uri=https://github.com/codelibs/fess-ds-git.git
+base_url=https://github.com/codelibs/fess/blob/master/
 extractors=text/.*:textExtractor,application/xml:textExtractor,application/javascript:textExtractor,
+prev_commit_id=
+delete_old_docs=false
 ```
 
 Script:
 
 ```
-url="https://github.com/codelibs/fess/blob/master/" + path
+url=url
 host="github.com"
-site="github.com/codelibs/fess/" + path
+site="github.com/codelibs/fess-ds-git/" + path
 title=name
 content=content
 cache=""
