@@ -415,7 +415,15 @@ public class GitDataStore extends AbstractDataStore {
             }
         } else {
             try {
+                final File repoFile = new File(repositoryPath);
+                final boolean exists = repoFile.exists();
+                if (!exists) {
+                    repoFile.mkdirs();
+                }
                 final Repository repository = FileRepositoryBuilder.create(new File(repositoryPath, ".git"));
+                if (!exists) {
+                    repository.create();
+                }
                 configMap.put(REPOSITORY, repository);
             } catch (final IOException e) {
                 throw new DataStoreException("Failed to load " + repositoryPath, e);
