@@ -47,6 +47,7 @@ import org.codelibs.fess.crawler.extractor.Extractor;
 import org.codelibs.fess.crawler.helper.MimeTypeHelper;
 import org.codelibs.fess.ds.AbstractDataStore;
 import org.codelibs.fess.ds.callback.IndexUpdateCallback;
+import org.codelibs.fess.es.client.FessEsClient;
 import org.codelibs.fess.es.config.exbhv.DataConfigBhv;
 import org.codelibs.fess.es.config.exentity.DataConfig;
 import org.codelibs.fess.exception.DataStoreCrawlingException;
@@ -171,12 +172,12 @@ public class GitDataStore extends AbstractDataStore {
                         break;
                     case DELETE:
                         if (StringUtil.isNotBlank(baseUrl)) {
-                            // TODO delete
+                            deleteDocument(paramMap, configMap);
                         }
                         break;
                     case RENAME:
                         if (StringUtil.isNotBlank(baseUrl)) {
-                            // TODO delete
+                            deleteDocument(paramMap, configMap);
                         }
                         processFile(dataConfig, callback, paramMap, scriptMap, defaultDataMap, configMap);
                         break;
@@ -191,14 +192,29 @@ public class GitDataStore extends AbstractDataStore {
         } catch (final Exception e) {
             throw new DataStoreException(e);
         } finally {
-            final File gitRepoPath = (File) configMap.get(TEMP_REPOSITORY_PATH);
-            if (gitRepoPath != null) {
-                try (Stream<Path> walk = Files.walk(gitRepoPath.toPath())) {
-                    walk.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
-                } catch (final IOException e) {
-                    logger.warn("Failed to delete " + gitRepoPath.getAbsolutePath(), e);
+            try {
+                repository.close();
+            } finally {
+                final File gitRepoPath = (File) configMap.get(TEMP_REPOSITORY_PATH);
+                if (gitRepoPath != null) {
+                    try (Stream<Path> walk = Files.walk(gitRepoPath.toPath())) {
+                        walk.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
+                    } catch (final IOException e) {
+                        logger.warn("Failed to delete " + gitRepoPath.getAbsolutePath(), e);
+                    }
                 }
             }
+        }
+    }
+
+    protected void deleteDocument(final Map<String, String> paramMap, final Map<String, Object> configMap) {
+        final DiffEntry entry = (DiffEntry) configMap.get(DIFF_ENTRY);
+        try {
+            final String url = getUrl(paramMap, entry.getOldPath());
+            final FessEsClient fessEsClient = ComponentUtil.getFessEsClient();
+            ComponentUtil.getIndexingHelper().deleteDocumentByUrl(fessEsClient, url);
+        } catch (final Exception e) {
+            logger.warn("Failed to delete the document {}.", entry);
         }
     }
 
