@@ -47,7 +47,6 @@ import org.codelibs.fess.crawler.extractor.Extractor;
 import org.codelibs.fess.crawler.helper.MimeTypeHelper;
 import org.codelibs.fess.ds.AbstractDataStore;
 import org.codelibs.fess.ds.callback.IndexUpdateCallback;
-import org.codelibs.fess.es.client.FessEsClient;
 import org.codelibs.fess.es.config.exbhv.DataConfigBhv;
 import org.codelibs.fess.es.config.exentity.DataConfig;
 import org.codelibs.fess.exception.DataStoreCrawlingException;
@@ -211,8 +210,7 @@ public class GitDataStore extends AbstractDataStore {
         final DiffEntry entry = (DiffEntry) configMap.get(DIFF_ENTRY);
         try {
             final String url = getUrl(paramMap, entry.getOldPath());
-            final FessEsClient fessEsClient = ComponentUtil.getFessEsClient();
-            ComponentUtil.getIndexingHelper().deleteDocumentByUrl(fessEsClient, url);
+            ComponentUtil.getIndexingHelper().deleteDocumentByUrl(ComponentUtil.getSearchEngineClient(), url);
         } catch (final Exception e) {
             logger.warn("Failed to delete the document {}.", entry);
         }
