@@ -1,4 +1,5 @@
-Git Data Store for Fess [![Build Status](https://travis-ci.org/codelibs/fess-ds-git.svg?branch=master)](https://travis-ci.org/codelibs/fess-ds-git)
+Git Data Store for Fess
+[![Java CI with Maven](https://github.com/codelibs/fess-ds-git/actions/workflows/maven.yml/badge.svg)](https://github.com/codelibs/fess-ds-git/actions/workflows/maven.yml)
 ==========================
 
 ## Overview
