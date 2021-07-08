@@ -220,9 +220,8 @@ public class GitDataStore extends AbstractDataStore {
         final String paramStr = dataConfig.getHandlerParameterMap().entrySet().stream().map(e -> {
             if (PREV_COMMIT_ID.equals(e.getKey())) {
                 return e.getKey() + "=" + toCommitId.name();
-            } else {
-                return e.getKey() + "=" + e.getValue();
             }
+            return e.getKey() + "=" + e.getValue();
         }).collect(Collectors.joining("\n"));
         dataConfig.setHandlerParameter(paramStr);
         if (logger.isDebugEnabled()) {
@@ -242,8 +241,7 @@ public class GitDataStore extends AbstractDataStore {
 
     protected void processFile(final DataConfig dataConfig, final IndexUpdateCallback callback, final Map<String, String> paramMap,
             final Map<String, String> scriptMap, final Map<String, Object> defaultDataMap, final Map<String, Object> configMap) {
-        final Map<String, Object> dataMap = new HashMap<>();
-        dataMap.putAll(defaultDataMap);
+        final Map<String, Object> dataMap = new HashMap<>(defaultDataMap);
         final String uri = (String) configMap.get(URI);
         final DiffEntry diffEntry = (DiffEntry) configMap.get(DIFF_ENTRY);
         final String path = diffEntry.getNewPath();
@@ -468,9 +466,8 @@ public class GitDataStore extends AbstractDataStore {
     protected InputStream getContentInputStream(final DeferredFileOutputStream out) throws IOException {
         if (out.isInMemory()) {
             return new ByteArrayInputStream(out.getData());
-        } else {
-            return new FileInputStream(out.getFile());
         }
+        return new FileInputStream(out.getFile());
     }
 
 }
