@@ -1,5 +1,5 @@
 /*
- * Copyright 2012-2021 CodeLibs Project and the Others.
+ * Copyright 2012-2022 CodeLibs Project and the Others.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,12 +34,12 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.apache.commons.io.output.DeferredFileOutputStream;
-import org.apache.tika.metadata.TikaMetadataKeys;
 import org.codelibs.core.io.CopyUtil;
 import org.codelibs.core.lang.StringUtil;
 import org.codelibs.core.misc.Pair;
 import org.codelibs.core.stream.StreamUtil;
 import org.codelibs.fess.app.service.FailureUrlService;
+import org.codelibs.fess.crawler.entity.ExtractData;
 import org.codelibs.fess.crawler.exception.CrawlingAccessException;
 import org.codelibs.fess.crawler.exception.MaxLengthExceededException;
 import org.codelibs.fess.crawler.exception.MultipleCrawlingAccessException;
@@ -274,7 +274,7 @@ public class GitDataStore extends AbstractDataStore {
                 final Extractor extractor = getExtractor(mimeType, configMap);
 
                 final Map<String, String> params = new HashMap<>();
-                params.put(TikaMetadataKeys.RESOURCE_NAME_KEY, name);
+                params.put(ExtractData.RESOURCE_NAME_KEY, name);
                 try (InputStream is = getContentInputStream(out)) {
                     String content = extractor.getText(is, params).getContent();
                     if (content == null) {
