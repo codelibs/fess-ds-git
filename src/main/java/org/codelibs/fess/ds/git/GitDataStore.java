@@ -38,6 +38,7 @@ import org.codelibs.core.io.CopyUtil;
 import org.codelibs.core.lang.StringUtil;
 import org.codelibs.core.misc.Pair;
 import org.codelibs.core.stream.StreamUtil;
+import org.codelibs.fess.Constants;
 import org.codelibs.fess.app.service.FailureUrlService;
 import org.codelibs.fess.crawler.entity.ExtractData;
 import org.codelibs.fess.crawler.exception.CrawlingAccessException;
@@ -60,7 +61,6 @@ import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.diff.DiffEntry;
 import org.eclipse.jgit.diff.DiffFormatter;
-import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.ObjectStream;
@@ -131,7 +131,7 @@ public class GitDataStore extends AbstractDataStore {
             throw new DataStoreException("uri is required.");
         }
         final String refSpec = paramMap.getAsString(REF_SPECS, "+refs/heads/*:refs/heads/*");
-        final String commitId = paramMap.getAsString(COMMIT_ID, Constants.HEAD);
+        final String commitId = paramMap.getAsString(COMMIT_ID, org.eclipse.jgit.lib.Constants.HEAD);
         final String username = paramMap.getAsString(USERNAME);
         final String password = paramMap.getAsString(PASSWORD);
         final String prevCommit = paramMap.getAsString(PREV_COMMIT_ID);
@@ -251,6 +251,7 @@ public class GitDataStore extends AbstractDataStore {
         final DiffEntry diffEntry = (DiffEntry) configMap.get(DIFF_ENTRY);
         final String path = diffEntry.getNewPath();
         final StatsKeyObject statsKey = new StatsKeyObject(uri);
+        paramMap.put(Constants.CRAWLER_STATS_KEY, statsKey);
         try {
             crawlerStatsHelper.begin(statsKey);
             final RevCommit revCommit = getRevCommit(configMap, path);
