@@ -47,10 +47,14 @@ import org.codelibs.fess.crawler.extractor.Extractor;
 import org.codelibs.fess.crawler.helper.MimeTypeHelper;
 import org.codelibs.fess.ds.AbstractDataStore;
 import org.codelibs.fess.ds.callback.IndexUpdateCallback;
+import org.codelibs.fess.entity.DataStoreParams;
 import org.codelibs.fess.es.config.exbhv.DataConfigBhv;
 import org.codelibs.fess.es.config.exentity.DataConfig;
 import org.codelibs.fess.exception.DataStoreCrawlingException;
 import org.codelibs.fess.exception.DataStoreException;
+import org.codelibs.fess.helper.CrawlerStatsHelper;
+import org.codelibs.fess.helper.CrawlerStatsHelper.StatsAction;
+import org.codelibs.fess.helper.CrawlerStatsHelper.StatsKeyObject;
 import org.codelibs.fess.util.ComponentUtil;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.GitAPIException;
@@ -120,19 +124,19 @@ public class GitDataStore extends AbstractDataStore {
     }
 
     @Override
-    protected void storeData(final DataConfig dataConfig, final IndexUpdateCallback callback, final Map<String, String> paramMap,
+    protected void storeData(final DataConfig dataConfig, final IndexUpdateCallback callback, final DataStoreParams paramMap,
             final Map<String, String> scriptMap, final Map<String, Object> defaultDataMap) {
-        final String uri = paramMap.get(URI);
+        final String uri = paramMap.getAsString(URI);
         if (StringUtil.isBlank(uri)) {
             throw new DataStoreException("uri is required.");
         }
-        final String refSpec = paramMap.getOrDefault(REF_SPECS, "+refs/heads/*:refs/heads/*");
-        final String commitId = paramMap.getOrDefault(COMMIT_ID, Constants.HEAD);
-        final String username = paramMap.get(USERNAME);
-        final String password = paramMap.get(PASSWORD);
-        final String prevCommit = paramMap.get(PREV_COMMIT_ID);
+        final String refSpec = paramMap.getAsString(REF_SPECS, "+refs/heads/*:refs/heads/*");
+        final String commitId = paramMap.getAsString(COMMIT_ID, Constants.HEAD);
+        final String username = paramMap.getAsString(USERNAME);
+        final String password = paramMap.getAsString(PASSWORD);
+        final String prevCommit = paramMap.getAsString(PREV_COMMIT_ID);
         final boolean isUpdateCommitId = prevCommit != null;
-        final String baseUrl = paramMap.get(BASE_URL);
+        final String baseUrl = paramMap.getAsString(BASE_URL);
         CredentialsProvider credentialsProvider = null;
         if (username != null && password != null) {
             credentialsProvider = new UsernamePasswordCredentialsProvider(username, password);
@@ -206,7 +210,7 @@ public class GitDataStore extends AbstractDataStore {
         }
     }
 
-    protected void deleteDocument(final Map<String, String> paramMap, final Map<String, Object> configMap) {
+    protected void deleteDocument(final DataStoreParams paramMap, final Map<String, Object> configMap) {
         final DiffEntry entry = (DiffEntry) configMap.get(DIFF_ENTRY);
         try {
             final String url = getUrl(paramMap, entry.getOldPath());
@@ -239,20 +243,22 @@ public class GitDataStore extends AbstractDataStore {
         return path.substring(pos + 1);
     }
 
-    protected void processFile(final DataConfig dataConfig, final IndexUpdateCallback callback, final Map<String, String> paramMap,
+    protected void processFile(final DataConfig dataConfig, final IndexUpdateCallback callback, final DataStoreParams paramMap,
             final Map<String, String> scriptMap, final Map<String, Object> defaultDataMap, final Map<String, Object> configMap) {
+        final CrawlerStatsHelper crawlerStatsHelper = ComponentUtil.getCrawlerStatsHelper();
         final Map<String, Object> dataMap = new HashMap<>(defaultDataMap);
         final String uri = (String) configMap.get(URI);
         final DiffEntry diffEntry = (DiffEntry) configMap.get(DIFF_ENTRY);
         final String path = diffEntry.getNewPath();
+        final StatsKeyObject statsKey = new StatsKeyObject(uri);
         try {
+            crawlerStatsHelper.begin(statsKey);
             final RevCommit revCommit = getRevCommit(configMap, path);
 
             final String name = getFileName(path);
             logger.info("Crawling Path: {}", path);
 
-            final Map<String, Object> resultMap = new LinkedHashMap<>();
-            resultMap.putAll(paramMap);
+            final Map<String, Object> resultMap = new LinkedHashMap<>(paramMap.asMap());
             final Repository repository = (Repository) configMap.get(REPOSITORY);
             final ObjectLoader objectLoader = repository.open(diffEntry.getNewId().toObjectId());
             final long size = objectLoader.getSize();
@@ -292,6 +298,8 @@ public class GitDataStore extends AbstractDataStore {
                 resultMap.put("committer", revCommit.getCommitterIdent());
                 resultMap.put("timestamp", new Date(revCommit.getCommitTime() * 1000L));
 
+                crawlerStatsHelper.record(statsKey, StatsAction.PREPARED);
+
                 if (logger.isDebugEnabled()) {
                     logger.debug("resultMap: {}", resultMap);
                 }
@@ -303,11 +311,19 @@ public class GitDataStore extends AbstractDataStore {
                         dataMap.put(entry.getKey(), convertValue);
                     }
                 }
+
+                crawlerStatsHelper.record(statsKey, StatsAction.EVALUATED);
+
                 if (logger.isDebugEnabled()) {
                     logger.debug("dataMap: {}", dataMap);
                 }
 
+                if (dataMap.get("url") instanceof String statsUrl) {
+                    statsKey.setUrl(statsUrl);
+                }
+
                 callback.store(paramMap, dataMap);
+                crawlerStatsHelper.record(statsKey, StatsAction.FINISHED);
             } finally {
                 if (dfos != null && !dfos.isInMemory()) {
                     final File file = dfos.getFile();
@@ -336,8 +352,7 @@ public class GitDataStore extends AbstractDataStore {
             }
 
             String url;
-            if (target instanceof DataStoreCrawlingException) {
-                final DataStoreCrawlingException dce = (DataStoreCrawlingException) target;
+            if (target instanceof DataStoreCrawlingException dce) {
                 url = dce.getUrl();
                 if (dce.aborted()) {
                     throw e;
@@ -347,6 +362,7 @@ public class GitDataStore extends AbstractDataStore {
             }
             final FailureUrlService failureUrlService = ComponentUtil.getComponent(FailureUrlService.class);
             failureUrlService.store(dataConfig, errorName, url, target);
+            crawlerStatsHelper.record(statsKey, StatsAction.ACCESS_EXCEPTION);
         } catch (final Throwable t) {
             logger.warn("Crawling Access Exception at : " + dataMap, t);
             final String url = uri + ":" + path;
@@ -357,6 +373,9 @@ public class GitDataStore extends AbstractDataStore {
             if (readInterval > 0) {
                 sleep(readInterval);
             }
+            crawlerStatsHelper.record(statsKey, StatsAction.EXCEPTION);
+        } finally {
+            crawlerStatsHelper.done(statsKey);
         }
     }
 
@@ -369,18 +388,18 @@ public class GitDataStore extends AbstractDataStore {
         return revCommitIter.next();
     }
 
-    protected String getUrl(final Map<String, String> paramMap, final String path) {
-        final String baseUrl = paramMap.get(BASE_URL);
+    protected String getUrl(final DataStoreParams paramMap, final String path) {
+        final String baseUrl = paramMap.getAsString(BASE_URL);
         if (StringUtil.isNotBlank(baseUrl)) {
             return baseUrl + path;
         }
         return StringUtil.EMPTY;
     }
 
-    protected Map<String, Object> createConfigMap(final Map<String, String> paramMap) {
+    protected Map<String, Object> createConfigMap(final DataStoreParams paramMap) {
         final Map<String, Object> configMap = new HashMap<>();
         @SuppressWarnings("unchecked")
-        final Pair<Pattern, String>[] extractors = StreamUtil.split(paramMap.get(EXTRACTORS), ",").get(stream -> stream.map(s -> {
+        final Pair<Pattern, String>[] extractors = StreamUtil.split(paramMap.getAsString(EXTRACTORS), ",").get(stream -> stream.map(s -> {
             final String[] values = s.split(":");
             if (values.length != 2) {
                 return null;
@@ -388,14 +407,14 @@ public class GitDataStore extends AbstractDataStore {
             return new Pair<>(Pattern.compile(values[0]), values[1]);
         }).filter(Objects::nonNull).toArray(n -> new Pair[n]));
         configMap.put(EXTRACTORS, extractors);
-        configMap.put(BASE_URL, paramMap.getOrDefault(BASE_URL, StringUtil.EMPTY));
-        configMap.put(CACHE_THRESHOLD, Integer.parseInt(paramMap.getOrDefault(CACHE_THRESHOLD, "1000000")));
-        configMap.put(DEFAULT_EXTRACTOR, paramMap.getOrDefault(DEFAULT_EXTRACTOR, "tikaExtractor"));
+        configMap.put(BASE_URL, paramMap.getAsString(BASE_URL, StringUtil.EMPTY));
+        configMap.put(CACHE_THRESHOLD, Integer.parseInt(paramMap.getAsString(CACHE_THRESHOLD, "1000000")));
+        configMap.put(DEFAULT_EXTRACTOR, paramMap.getAsString(DEFAULT_EXTRACTOR, "tikaExtractor"));
         configMap.put(READ_INTERVAL, getReadInterval(paramMap));
-        final String maxSize = paramMap.get(MAX_SIZE);
+        final String maxSize = paramMap.getAsString(MAX_SIZE);
         configMap.put(MAX_SIZE, StringUtil.isNotBlank(maxSize) ? Long.parseLong(maxSize) : 10000000L);
 
-        final String repositoryPath = paramMap.get(REPOSITORY_PATH);
+        final String repositoryPath = paramMap.getAsString(REPOSITORY_PATH);
         if (StringUtil.isBlank(repositoryPath)) {
             try {
                 final File gitRepoPath = File.createTempFile("fess-ds-git-", "");
