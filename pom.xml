@@ -17,7 +17,7 @@
 		<relativePath />
 	</parent>
 	<properties>
-		<jgit.version>5.4.2.201908231537-r</jgit.version>
+		<jgit.version>6.1.0.202203080745-r</jgit.version>
 	</properties>
 	<build>
 		<plugins>

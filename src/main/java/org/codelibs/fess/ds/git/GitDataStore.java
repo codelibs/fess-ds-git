@@ -45,6 +45,7 @@ import org.codelibs.fess.crawler.exception.CrawlingAccessException;
 import org.codelibs.fess.crawler.exception.MaxLengthExceededException;
 import org.codelibs.fess.crawler.exception.MultipleCrawlingAccessException;
 import org.codelibs.fess.crawler.extractor.Extractor;
+import org.codelibs.fess.crawler.filter.UrlFilter;
 import org.codelibs.fess.crawler.helper.MimeTypeHelper;
 import org.codelibs.fess.ds.AbstractDataStore;
 import org.codelibs.fess.ds.callback.IndexUpdateCallback;
@@ -118,6 +119,12 @@ public class GitDataStore extends AbstractDataStore {
 
     protected static final String MAX_SIZE = "max_size";
 
+    protected static final String INCLUDE_PATTERN = "include_pattern";
+
+    protected static final String EXCLUDE_PATTERN = "exclude_pattern";
+
+    protected static final String URL_FILTER = "url_filter";
+
     @Override
     protected String getName() {
         return this.getClass().getSimpleName();
@@ -145,6 +152,8 @@ public class GitDataStore extends AbstractDataStore {
         final Map<String, Object> configMap = createConfigMap(paramMap);
         configMap.put(URI, uri);
 
+        final UrlFilter urlFilter = getUrlFilter(paramMap);
+
         logger.info("Git: {}", uri);
 
         final Repository repository = (Repository) configMap.get(REPOSITORY);
@@ -167,10 +176,16 @@ public class GitDataStore extends AbstractDataStore {
             try (DiffFormatter diffFormatter = new DiffFormatter(null)) {
                 diffFormatter.setRepository(repository);
                 diffFormatter.scan(fromCommitId, toCommitId).forEach(entry -> {
+                    final String path = entry.getNewPath();
+                    if (urlFilter != null && !urlFilter.match(path)) {
+                        if (logger.isDebugEnabled()) {
+                            logger.debug("Not matched: {}", path);
+                        }
+                        return;
+                    }
                     configMap.put(DIFF_ENTRY, entry);
                     switch (entry.getChangeType()) {
-                    case ADD:
-                    case MODIFY:
+                    case ADD, MODIFY:
                         processFile(dataConfig, callback, paramMap, scriptMap, defaultDataMap, configMap);
                         break;
                     case DELETE:
@@ -490,4 +505,20 @@ public class GitDataStore extends AbstractDataStore {
         return new FileInputStream(out.getFile());
     }
 
+    protected UrlFilter getUrlFilter(final DataStoreParams paramMap) {
+        final UrlFilter urlFilter = ComponentUtil.getComponent(UrlFilter.class);
+        final String include = paramMap.getAsString(INCLUDE_PATTERN);
+        if (StringUtil.isNotBlank(include)) {
+            urlFilter.addInclude(include);
+        }
+        final String exclude = paramMap.getAsString(EXCLUDE_PATTERN);
+        if (StringUtil.isNotBlank(exclude)) {
+            urlFilter.addExclude(exclude);
+        }
+        urlFilter.init(paramMap.getAsString(Constants.CRAWLING_INFO_ID));
+        if (logger.isDebugEnabled()) {
+            logger.debug("urlFilter: {}", urlFilter);
+        }
+        return urlFilter;
+    }
 }
