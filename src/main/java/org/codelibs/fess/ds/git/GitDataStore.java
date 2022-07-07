@@ -65,6 +65,7 @@ import org.eclipse.jgit.diff.DiffFormatter;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.ObjectStream;
+import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
@@ -161,9 +162,15 @@ public class GitDataStore extends AbstractDataStore {
         try (final Git git = new Git(repository)) {
             configMap.put(GIT, git);
             final FetchResult fetchResult = git.fetch().setForceUpdate(true).setRemote(uri).setRefSpecs(new RefSpec(refSpec))
-                    .setCredentialsProvider(credentialsProvider).call();
+                    .setInitialBranch(commitId).setCredentialsProvider(credentialsProvider).call();
             if (logger.isDebugEnabled()) {
                 logger.debug("Fetch Result: {}", fetchResult.getMessages());
+            }
+            if (!hasCommitLogs(configMap)) {
+                final Ref ref = git.checkout().setName(commitId).call();
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Checked out {}", ref.getName());
+                }
             }
             final ObjectId fromCommitId;
             if (StringUtil.isNotBlank(prevCommit)) {
@@ -175,6 +182,7 @@ public class GitDataStore extends AbstractDataStore {
             configMap.put(CURRENT_COMMIT_ID, toCommitId);
             try (DiffFormatter diffFormatter = new DiffFormatter(null)) {
                 diffFormatter.setRepository(repository);
+                logger.info("Rev: {} -> {}", fromCommitId, toCommitId);
                 diffFormatter.scan(fromCommitId, toCommitId).forEach(entry -> {
                     final String path = entry.getNewPath();
                     if (urlFilter != null && !urlFilter.match(path)) {
@@ -392,6 +400,19 @@ public class GitDataStore extends AbstractDataStore {
             crawlerStatsHelper.record(statsKey, StatsAction.EXCEPTION);
         } finally {
             crawlerStatsHelper.done(statsKey);
+        }
+    }
+
+    protected boolean hasCommitLogs(final Map<String, Object> configMap) {
+        final Git git = (Git) configMap.get(GIT);
+        try {
+            git.log().call();
+            return true;
+        } catch (final Exception e) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("Could not find commit logs.", e);
+            }
+            return false;
         }
     }
 
