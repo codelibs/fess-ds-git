@@ -311,6 +311,15 @@ public class GitDataStore extends AbstractDataStore {
                         content = StringUtil.EMPTY;
                     }
                     resultMap.put("content", content);
+                } catch (final Exception e) {
+                    if (!ComponentUtil.getFessConfig().isCrawlerIgnoreContentException()) {
+                        throw e;
+                    }
+                    if (logger.isDebugEnabled()) {
+                        logger.warn("Could not get a text from {}.", uri, e);
+                    } else {
+                        logger.warn("Could not get a text from {}. {}", uri, e.getMessage());
+                    }
                 }
 
                 resultMap.put("url", getUrl(paramMap, path));
