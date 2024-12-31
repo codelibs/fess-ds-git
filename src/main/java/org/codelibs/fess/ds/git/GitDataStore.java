@@ -34,6 +34,8 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.apache.commons.io.output.DeferredFileOutputStream;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.codelibs.core.io.CopyUtil;
 import org.codelibs.core.lang.StringUtil;
 import org.codelibs.core.misc.Pair;
@@ -73,12 +75,10 @@ import org.eclipse.jgit.transport.CredentialsProvider;
 import org.eclipse.jgit.transport.FetchResult;
 import org.eclipse.jgit.transport.RefSpec;
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 public class GitDataStore extends AbstractDataStore {
 
-    private static final Logger logger = LoggerFactory.getLogger(GitDataStore.class);
+    private static final Logger logger = LogManager.getLogger(GitDataStore.class);
 
     protected static final String PASSWORD = "password";
 
