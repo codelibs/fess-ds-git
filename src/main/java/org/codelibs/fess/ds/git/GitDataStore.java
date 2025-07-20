@@ -318,14 +318,20 @@ public class GitDataStore extends AbstractDataStore {
     }
 
     /**
-     * Processes a file.
+     * Processes a file from a Git repository.
+     * <p>
+     * This method extracts content and metadata from the specified file
+     * for the purpose of indexing it into the search engine. It uses the
+     * provided data configuration, callback, and parameter maps to perform
+     * the processing and indexing.
+     * </p>
      *
-     * @param dataConfig The data configuration.
-     * @param callback The callback for indexing.
-     * @param paramMap The parameter map.
-     * @param scriptMap The script map.
-     * @param defaultDataMap The default data map.
-     * @param configMap The configuration map.
+     * @param dataConfig The data configuration containing repository settings.
+     * @param callback The callback used for indexing the extracted data.
+     * @param paramMap The parameter map containing additional settings.
+     * @param scriptMap The script map for custom processing logic.
+     * @param defaultDataMap The default data map for fallback values.
+     * @param configMap The configuration map containing file-specific settings.
      */
     protected void processFile(final DataConfig dataConfig, final IndexUpdateCallback callback, final DataStoreParams paramMap,
             final Map<String, String> scriptMap, final Map<String, Object> defaultDataMap, final Map<String, Object> configMap) {
