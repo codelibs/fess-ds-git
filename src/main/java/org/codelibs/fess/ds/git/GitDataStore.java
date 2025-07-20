@@ -90,7 +90,7 @@ public class GitDataStore extends AbstractDataStore {
 
     private static final Logger logger = LogManager.getLogger(GitDataStore.class);
 
-    /** Parameter key for the password. */
+    /** Configuration parameter key for Git repository authentication password. */
     protected static final String PASSWORD = "password";
 
     /** Parameter key for the username. */
