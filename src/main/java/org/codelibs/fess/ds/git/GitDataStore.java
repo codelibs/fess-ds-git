@@ -76,54 +76,87 @@ import org.eclipse.jgit.transport.FetchResult;
 import org.eclipse.jgit.transport.RefSpec;
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 
+/**
+ * A data store for crawling Git repositories.
+ */
 public class GitDataStore extends AbstractDataStore {
+
+    /**
+     * Default constructor.
+     */
+    public GitDataStore() {
+        super();
+    }
 
     private static final Logger logger = LogManager.getLogger(GitDataStore.class);
 
+    /** Configuration parameter key for Git repository authentication password. */
     protected static final String PASSWORD = "password";
 
+    /** Parameter key for the username. */
     protected static final String USERNAME = "username";
 
+    /** Parameter key for the commit ID. */
     protected static final String COMMIT_ID = "commit_id";
 
+    /** Parameter key for the ref specs. */
     protected static final String REF_SPECS = "ref_specs";
 
+    /** Parameter key for the default extractor. */
     protected static final String DEFAULT_EXTRACTOR = "default_extractor";
 
+    /** Parameter key for the cache threshold. */
     protected static final String CACHE_THRESHOLD = "cache_threshold";
 
+    /** Parameter key for the extractors. */
     protected static final String EXTRACTORS = "extractors";
 
+    /** Parameter key for the read interval. */
     protected static final String READ_INTERVAL = "read_interval";
 
+    /** Parameter key for the tree walk. */
     protected static final String TREE_WALK = "tree_walk";
 
+    /** Parameter key for the rev commit. */
     protected static final String REV_COMMIT = "rev_commit";
 
+    /** Parameter key for the repository. */
     protected static final String REPOSITORY = "repository";
 
+    /** Parameter key for the URI. */
     protected static final String URI = "uri";
 
+    /** Parameter key for the base URL. */
     protected static final String BASE_URL = "base_url";
 
+    /** Parameter key for the diff entry. */
     protected static final String DIFF_ENTRY = "diff_entry";
 
+    /** Parameter key for the Git instance. */
     protected static final String GIT = "git";
 
+    /** Parameter key for the current commit ID. */
     protected static final String CURRENT_COMMIT_ID = "current_commit_id";
 
+    /** Parameter key for the previous commit ID. */
     protected static final String PREV_COMMIT_ID = "prev_commit_id";
 
+    /** Parameter key for the temporary repository path. */
     protected static final String TEMP_REPOSITORY_PATH = "temp_repository_path";
 
+    /** Parameter key for the repository path. */
     protected static final String REPOSITORY_PATH = "repository_path";
 
+    /** Parameter key for the max size. */
     protected static final String MAX_SIZE = "max_size";
 
+    /** Parameter key for the include pattern. */
     protected static final String INCLUDE_PATTERN = "include_pattern";
 
+    /** Parameter key for the exclude pattern. */
     protected static final String EXCLUDE_PATTERN = "exclude_pattern";
 
+    /** Parameter key for the URL filter. */
     protected static final String URL_FILTER = "url_filter";
 
     @Override
@@ -233,6 +266,12 @@ public class GitDataStore extends AbstractDataStore {
         }
     }
 
+    /**
+     * Deletes a document from the index.
+     *
+     * @param paramMap The parameter map.
+     * @param configMap The configuration map.
+     */
     protected void deleteDocument(final DataStoreParams paramMap, final Map<String, Object> configMap) {
         final DiffEntry entry = (DiffEntry) configMap.get(DIFF_ENTRY);
         try {
@@ -243,6 +282,12 @@ public class GitDataStore extends AbstractDataStore {
         }
     }
 
+    /**
+     * Updates the data configuration with the new commit ID.
+     *
+     * @param dataConfig The data configuration.
+     * @param toCommitId The new commit ID.
+     */
     protected void updateDataConfig(final DataConfig dataConfig, final ObjectId toCommitId) {
         final String paramStr = dataConfig.getHandlerParameterMap().entrySet().stream().map(e -> {
             if (PREV_COMMIT_ID.equals(e.getKey())) {
@@ -258,6 +303,12 @@ public class GitDataStore extends AbstractDataStore {
         logger.info("Updated DataConfig: {}", dataConfig.getId());
     }
 
+    /**
+     * Returns the file name from the given path.
+     *
+     * @param path The path.
+     * @return The file name.
+     */
     protected String getFileName(final String path) {
         final int pos = path.lastIndexOf('/');
         if (pos == -1) {
@@ -266,6 +317,22 @@ public class GitDataStore extends AbstractDataStore {
         return path.substring(pos + 1);
     }
 
+    /**
+     * Processes a file from a Git repository.
+     * <p>
+     * This method extracts content and metadata from the specified file
+     * for the purpose of indexing it into the search engine. It uses the
+     * provided data configuration, callback, and parameter maps to perform
+     * the processing and indexing.
+     * </p>
+     *
+     * @param dataConfig The data configuration containing repository settings.
+     * @param callback The callback used for indexing the extracted data.
+     * @param paramMap The parameter map containing additional settings.
+     * @param scriptMap The script map for custom processing logic.
+     * @param defaultDataMap The default data map for fallback values.
+     * @param configMap The configuration map containing file-specific settings.
+     */
     protected void processFile(final DataConfig dataConfig, final IndexUpdateCallback callback, final DataStoreParams paramMap,
             final Map<String, String> scriptMap, final Map<String, Object> defaultDataMap, final Map<String, Object> configMap) {
         final CrawlerStatsHelper crawlerStatsHelper = ComponentUtil.getCrawlerStatsHelper();
@@ -412,6 +479,12 @@ public class GitDataStore extends AbstractDataStore {
         }
     }
 
+    /**
+     * Checks if the repository has commit logs.
+     *
+     * @param configMap The configuration map.
+     * @return true if the repository has commit logs, false otherwise.
+     */
     protected boolean hasCommitLogs(final Map<String, Object> configMap) {
         final Git git = (Git) configMap.get(GIT);
         try {
@@ -425,6 +498,14 @@ public class GitDataStore extends AbstractDataStore {
         }
     }
 
+    /**
+     * Returns the revision commit for the given path.
+     *
+     * @param configMap The configuration map.
+     * @param path The path.
+     * @return The revision commit.
+     * @throws GitAPIException If an error occurs while accessing the Git repository.
+     */
     protected RevCommit getRevCommit(final Map<String, Object> configMap, final String path) throws GitAPIException {
         final Git git = (Git) configMap.get(GIT);
         final Iterator<RevCommit> revCommitIter = git.log().addPath(path).setMaxCount(1).call().iterator();
@@ -434,6 +515,13 @@ public class GitDataStore extends AbstractDataStore {
         return revCommitIter.next();
     }
 
+    /**
+     * Returns the URL for the given path.
+     *
+     * @param paramMap The parameter map.
+     * @param path The path.
+     * @return The URL.
+     */
     protected String getUrl(final DataStoreParams paramMap, final String path) {
         final String baseUrl = paramMap.getAsString(BASE_URL);
         if (StringUtil.isNotBlank(baseUrl)) {
@@ -442,6 +530,12 @@ public class GitDataStore extends AbstractDataStore {
         return StringUtil.EMPTY;
     }
 
+    /**
+     * Creates a configuration map.
+     *
+     * @param paramMap The parameter map.
+     * @return The configuration map.
+     */
     protected Map<String, Object> createConfigMap(final DataStoreParams paramMap) {
         final Map<String, Object> configMap = new HashMap<>();
         @SuppressWarnings("unchecked")
@@ -494,6 +588,13 @@ public class GitDataStore extends AbstractDataStore {
         return configMap;
     }
 
+    /**
+     * Returns the extractor for the given MIME type.
+     *
+     * @param mimeType The MIME type.
+     * @param configMap The configuration map.
+     * @return The extractor.
+     */
     protected Extractor getExtractor(final String mimeType, final Map<String, Object> configMap) {
         @SuppressWarnings("unchecked")
         final Pair<Pattern, String>[] extractors = (Pair<Pattern, String>[]) configMap.get(EXTRACTORS);
@@ -521,6 +622,14 @@ public class GitDataStore extends AbstractDataStore {
         return extractor;
     }
 
+    /**
+     * Returns the MIME type for the given file name.
+     *
+     * @param filename The file name.
+     * @param out The deferred file output stream.
+     * @return The MIME type.
+     * @throws IOException If an I/O error occurs.
+     */
     protected String getMimeType(final String filename, final DeferredFileOutputStream out) throws IOException {
         final MimeTypeHelper mimeTypeHelper = ComponentUtil.getComponent(MimeTypeHelper.class);
         try (InputStream is = getContentInputStream(out)) {
@@ -528,6 +637,13 @@ public class GitDataStore extends AbstractDataStore {
         }
     }
 
+    /**
+     * Returns the content input stream from the deferred file output stream.
+     *
+     * @param out The deferred file output stream.
+     * @return The content input stream.
+     * @throws IOException If an I/O error occurs.
+     */
     protected InputStream getContentInputStream(final DeferredFileOutputStream out) throws IOException {
         if (out.isInMemory()) {
             return new ByteArrayInputStream(out.getData());
@@ -535,6 +651,12 @@ public class GitDataStore extends AbstractDataStore {
         return new FileInputStream(out.getFile());
     }
 
+    /**
+     * Returns the URL filter.
+     *
+     * @param paramMap The parameter map.
+     * @return The URL filter.
+     */
     protected UrlFilter getUrlFilter(final DataStoreParams paramMap) {
         final UrlFilter urlFilter = ComponentUtil.getComponent(UrlFilter.class);
         final String include = paramMap.getAsString(INCLUDE_PATTERN);
