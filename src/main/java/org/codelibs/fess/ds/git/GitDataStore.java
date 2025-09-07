@@ -194,8 +194,13 @@ public class GitDataStore extends AbstractDataStore {
         configMap.put(REPOSITORY, repository);
         try (final Git git = new Git(repository)) {
             configMap.put(GIT, git);
-            final FetchResult fetchResult = git.fetch().setForceUpdate(true).setRemote(uri).setRefSpecs(new RefSpec(refSpec))
-                    .setInitialBranch(commitId).setCredentialsProvider(credentialsProvider).call();
+            final FetchResult fetchResult = git.fetch()
+                    .setForceUpdate(true)
+                    .setRemote(uri)
+                    .setRefSpecs(new RefSpec(refSpec))
+                    .setInitialBranch(commitId)
+                    .setCredentialsProvider(credentialsProvider)
+                    .call();
             if (logger.isDebugEnabled()) {
                 logger.debug("Fetch Result: {}", fetchResult.getMessages());
             }
