@@ -176,7 +176,6 @@ public class GitDataStore extends AbstractDataStore {
         final String username = paramMap.getAsString(USERNAME);
         final String password = paramMap.getAsString(PASSWORD);
         final String prevCommit = paramMap.getAsString(PREV_COMMIT_ID);
-        final boolean isUpdateCommitId = prevCommit != null;
         final String baseUrl = paramMap.getAsString(BASE_URL);
         CredentialsProvider credentialsProvider = null;
         if (username != null && password != null) {
@@ -191,7 +190,6 @@ public class GitDataStore extends AbstractDataStore {
         logger.info("Git: {}", uri);
 
         final Repository repository = (Repository) configMap.get(REPOSITORY);
-        configMap.put(REPOSITORY, repository);
         try (final Git git = new Git(repository)) {
             configMap.put(GIT, git);
             final FetchResult fetchResult = git.fetch()
@@ -222,7 +220,12 @@ public class GitDataStore extends AbstractDataStore {
                 diffFormatter.setRepository(repository);
                 logger.info("Rev: {} -> {}", fromCommitId, toCommitId);
                 diffFormatter.scan(fromCommitId, toCommitId).forEach(entry -> {
-                    final String path = entry.getNewPath();
+                    final String path;
+                    if (entry.getChangeType() == DiffEntry.ChangeType.DELETE) {
+                        path = entry.getOldPath();
+                    } else {
+                        path = entry.getNewPath();
+                    }
                     if (urlFilter != null && !urlFilter.match(path)) {
                         if (logger.isDebugEnabled()) {
                             logger.debug("Not matched: {}", path);
@@ -250,7 +253,7 @@ public class GitDataStore extends AbstractDataStore {
                     }
                 });
             }
-            if (isUpdateCommitId) {
+            if (dataConfig != null) {
                 updateDataConfig(dataConfig, toCommitId);
             }
         } catch (final Exception e) {
@@ -264,7 +267,7 @@ public class GitDataStore extends AbstractDataStore {
                     try (Stream<Path> walk = Files.walk(gitRepoPath.toPath())) {
                         walk.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
                     } catch (final IOException e) {
-                        logger.warn("Failed to delete " + gitRepoPath.getAbsolutePath(), e);
+                        logger.warn("Failed to delete {}.", gitRepoPath.getAbsolutePath(), e);
                     }
                 }
             }
@@ -294,12 +297,21 @@ public class GitDataStore extends AbstractDataStore {
      * @param toCommitId The new commit ID.
      */
     protected void updateDataConfig(final DataConfig dataConfig, final ObjectId toCommitId) {
-        final String paramStr = dataConfig.getHandlerParameterMap().entrySet().stream().map(e -> {
-            if (PREV_COMMIT_ID.equals(e.getKey())) {
-                return e.getKey() + "=" + toCommitId.name();
-            }
-            return e.getKey() + "=" + e.getValue();
-        }).collect(Collectors.joining("\n"));
+        final Map<String, String> handlerParameterMap = dataConfig.getHandlerParameterMap();
+        final boolean hasPrevCommitId = handlerParameterMap.containsKey(PREV_COMMIT_ID);
+        final String paramStr;
+        if (hasPrevCommitId) {
+            paramStr = handlerParameterMap.entrySet().stream().map(e -> {
+                if (PREV_COMMIT_ID.equals(e.getKey())) {
+                    return e.getKey() + "=" + toCommitId.name();
+                }
+                return e.getKey() + "=" + e.getValue();
+            }).collect(Collectors.joining("\n"));
+        } else {
+            final String existing =
+                    handlerParameterMap.entrySet().stream().map(e -> e.getKey() + "=" + e.getValue()).collect(Collectors.joining("\n"));
+            paramStr = existing + "\n" + PREV_COMMIT_ID + "=" + toCommitId.name();
+        }
         dataConfig.setHandlerParameter(paramStr);
         if (logger.isDebugEnabled()) {
             logger.debug("Updating data config by {}.", paramStr);
@@ -438,7 +450,7 @@ public class GitDataStore extends AbstractDataStore {
                 }
             }
         } catch (final CrawlingAccessException e) {
-            logger.warn("Crawling Access Exception at : " + dataMap, e);
+            logger.warn("Crawling Access Exception at : {}", dataMap, e);
 
             Throwable target = e;
             if (target instanceof MultipleCrawlingAccessException) {
@@ -469,7 +481,7 @@ public class GitDataStore extends AbstractDataStore {
             failureUrlService.store(dataConfig, errorName, url, target);
             crawlerStatsHelper.record(statsKey, StatsAction.ACCESS_EXCEPTION);
         } catch (final Throwable t) {
-            logger.warn("Crawling Access Exception at : " + dataMap, t);
+            logger.warn("Crawling Access Exception at : {}", dataMap, t);
             final String url = uri + ":" + path;
             final FailureUrlService failureUrlService = ComponentUtil.getComponent(FailureUrlService.class);
             failureUrlService.store(dataConfig, t.getClass().getCanonicalName(), url, t);
@@ -511,9 +523,10 @@ public class GitDataStore extends AbstractDataStore {
      * @return The revision commit.
      * @throws GitAPIException If an error occurs while accessing the Git repository.
      */
-    protected RevCommit getRevCommit(final Map<String, Object> configMap, final String path) throws GitAPIException {
+    protected RevCommit getRevCommit(final Map<String, Object> configMap, final String path) throws GitAPIException, IOException {
         final Git git = (Git) configMap.get(GIT);
-        final Iterator<RevCommit> revCommitIter = git.log().addPath(path).setMaxCount(1).call().iterator();
+        final ObjectId currentCommitId = (ObjectId) configMap.get(CURRENT_COMMIT_ID);
+        final Iterator<RevCommit> revCommitIter = git.log().add(currentCommitId).addPath(path).setMaxCount(1).call().iterator();
         if (!revCommitIter.hasNext()) {
             throw new DataStoreException("Failed to parse git log for " + path);
         }
@@ -562,11 +575,7 @@ public class GitDataStore extends AbstractDataStore {
         final String repositoryPath = paramMap.getAsString(REPOSITORY_PATH);
         if (StringUtil.isBlank(repositoryPath)) {
             try {
-                final File gitRepoPath = File.createTempFile("fess-ds-git-", "");
-                if (!gitRepoPath.delete()) {
-                    throw new DataStoreException("Could not delete temporary file " + gitRepoPath);
-                }
-                gitRepoPath.mkdirs();
+                final File gitRepoPath = Files.createTempDirectory("fess-ds-git-").toFile();
                 final Repository repository = FileRepositoryBuilder.create(new File(gitRepoPath, ".git"));
                 repository.create();
                 configMap.put(REPOSITORY, repository);
