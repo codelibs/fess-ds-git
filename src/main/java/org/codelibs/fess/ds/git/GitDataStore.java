@@ -522,6 +522,7 @@ public class GitDataStore extends AbstractDataStore {
      * @param path The path.
      * @return The revision commit.
      * @throws GitAPIException If an error occurs while accessing the Git repository.
+     * @throws IOException If an I/O error occurs while reading the Git repository.
      */
     protected RevCommit getRevCommit(final Map<String, Object> configMap, final String path) throws GitAPIException, IOException {
         final Git git = (Git) configMap.get(GIT);
