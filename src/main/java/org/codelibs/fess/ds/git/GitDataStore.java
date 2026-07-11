@@ -20,8 +20,14 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.net.URISyntaxException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
@@ -29,8 +35,8 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.apache.commons.io.output.DeferredFileOutputStream;
@@ -68,12 +74,15 @@ import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.ObjectLoader;
 import org.eclipse.jgit.lib.ObjectStream;
 import org.eclipse.jgit.lib.Ref;
+import org.eclipse.jgit.lib.RefUpdate;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 import org.eclipse.jgit.transport.CredentialsProvider;
 import org.eclipse.jgit.transport.FetchResult;
 import org.eclipse.jgit.transport.RefSpec;
+import org.eclipse.jgit.transport.URIish;
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 
 /**
@@ -141,11 +150,30 @@ public class GitDataStore extends AbstractDataStore {
     /** Parameter key for the previous commit ID. */
     protected static final String PREV_COMMIT_ID = "prev_commit_id";
 
+    /** Parameter key for the previous source ref (uri + resolved commit ref) used to detect a changed source configuration. */
+    protected static final String PREV_SOURCE_REF = "prev_source_ref";
+
     /** Parameter key for the temporary repository path. */
     protected static final String TEMP_REPOSITORY_PATH = "temp_repository_path";
 
     /** Parameter key for the repository path. */
     protected static final String REPOSITORY_PATH = "repository_path";
+
+    /**
+     * Parameter key for Fess's framework-level "delete old documents" behavior. This is handled by Fess's
+     * crawling infrastructure ({@code DataIndexHelper}), not by this plugin; it is read here only to warn when
+     * a persistent {@link #REPOSITORY_PATH} is used without disabling it (see {@link #storeData}).
+     */
+    protected static final String DELETE_OLD_DOCS = "delete_old_docs";
+
+    /** File name of the advisory lock marker placed next to a persistent {@code repository_path}. */
+    protected static final String LOCK_FILE_NAME = ".fess-ds-git.lock";
+
+    /** Configuration map key for the repository lock channel. */
+    protected static final String REPOSITORY_LOCK_CHANNEL = "repository_lock_channel";
+
+    /** Configuration map key for the repository lock. */
+    protected static final String REPOSITORY_LOCK = "repository_lock";
 
     /** Parameter key for the max size. */
     protected static final String MAX_SIZE = "max_size";
@@ -176,18 +204,69 @@ public class GitDataStore extends AbstractDataStore {
         final String username = paramMap.getAsString(USERNAME);
         final String password = paramMap.getAsString(PASSWORD);
         final String prevCommit = paramMap.getAsString(PREV_COMMIT_ID);
+        final String prevSourceRef = paramMap.getAsString(PREV_SOURCE_REF);
         final String baseUrl = paramMap.getAsString(BASE_URL);
+        final String repositoryPath = paramMap.getAsString(REPOSITORY_PATH);
         CredentialsProvider credentialsProvider = null;
         if (username != null && password != null) {
             credentialsProvider = new UsernamePasswordCredentialsProvider(username, password);
         }
 
-        final Map<String, Object> configMap = createConfigMap(paramMap);
-        configMap.put(URI, uri);
+        if (StringUtil.isBlank(baseUrl)) {
+            logger.warn("base_url is blank: indexed document URLs will be empty and delete/rename tracking will be skipped.");
+        }
 
+        // A persistent repository_path exists to preserve state across runs, but the fail-fast checks this
+        // plugin adds (unresolvable commit_id, lock contention, etc.) only stop ITS OWN per-file deletes:
+        // Fess's crawling infrastructure still runs deleteOldDocs() after every crawl attempt -- success OR
+        // failure -- unless delete_old_docs=false. So a failed/aborted run would otherwise prune every
+        // previously-indexed document of this DataConfig. Warn so the "required, not just safer" constraint is
+        // visible at runtime, not just in the README.
+        if (StringUtil.isNotBlank(repositoryPath) && !Constants.FALSE.equals(paramMap.getAsString(DELETE_OLD_DOCS))) {
+            logger.warn("repository_path is set but delete_old_docs is not 'false': a failed or aborted crawl will let Fess "
+                    + "prune all previously-indexed documents for this DataConfig. Set delete_old_docs=false to keep the "
+                    + "existing index intact across failed/aborted runs.");
+        }
+
+        // getUrlFilter()/logger.info() only depend on paramMap/uri (not on configMap/the lock below), so they
+        // are deliberately resolved BEFORE the lock is acquired: getUrlFilter() can throw (e.g.
+        // ComponentNotFoundException, or CrawlerSystemException from UrlFilterImpl#init), and if that
+        // happened between lock acquisition and the try/finally that releases it, the lock would leak for the
+        // life of the JVM -- blocking every future crawl of this repository_path, i.e. exactly the
+        // repeated-crawl-failure class this PR exists to eliminate.
         final UrlFilter urlFilter = getUrlFilter(paramMap);
 
-        logger.info("Git: {}", uri);
+        logger.info("Git: {}", redactUrl(uri));
+
+        // The advisory lock must be acquired BEFORE createConfigMap() has a chance to initialize a brand-new
+        // repository_path (repository.create() writes HEAD/config/description/refs/objects non-atomically):
+        // otherwise the very first concurrent use of a not-yet-existing repository_path by two overlapping
+        // crawls would race unprotected. A lock-holder map is used (rather than configMap directly) because
+        // configMap does not exist until createConfigMap() returns; it is merged in below once available so
+        // the normal cleanup path (releaseRepositoryLock(configMap) in the finally block) still applies.
+        final Map<String, Object> lockHolder = new HashMap<>();
+        if (StringUtil.isNotBlank(repositoryPath)) {
+            final File repoDir = new File(repositoryPath);
+            // Idempotent and harmless even under a genuine race: unlike JGit's multi-file repository.create(),
+            // creating an empty directory concurrently has no corruption risk. It only exists to give the
+            // lock marker file (below) somewhere to live.
+            repoDir.mkdirs();
+            lockRepositoryPath(repoDir, lockHolder);
+        }
+        final Map<String, Object> configMap;
+        try {
+            configMap = createConfigMap(paramMap);
+        } catch (final Exception e) {
+            releaseRepositoryLock(lockHolder);
+            throw new DataStoreException("Failed to initialize Git repository " + redactUrl(uri), e);
+        } catch (final Error e) {
+            // An Error (e.g. NoClassDefFoundError) raised after the advisory lock was acquired must not leak
+            // it; release the lock and rethrow the Error unchanged so it still propagates.
+            releaseRepositoryLock(lockHolder);
+            throw e;
+        }
+        configMap.putAll(lockHolder);
+        configMap.put(URI, uri);
 
         final Repository repository = (Repository) configMap.get(REPOSITORY);
         try (final Git git = new Git(repository)) {
@@ -202,19 +281,25 @@ public class GitDataStore extends AbstractDataStore {
             if (logger.isDebugEnabled()) {
                 logger.debug("Fetch Result: {}", fetchResult.getMessages());
             }
+            final String resolvedCommitId = resolveDefaultBranch(repository, fetchResult, commitId);
             if (!hasCommitLogs(configMap)) {
-                final Ref ref = git.checkout().setName(commitId).call();
+                final Ref ref = git.checkout().setName(resolvedCommitId).call();
                 if (logger.isDebugEnabled()) {
                     logger.debug("Checked out {}", ref.getName());
                 }
             }
+            final String currentSourceRef = redactUrl(uri) + "#" + resolvedCommitId;
             final ObjectId fromCommitId;
-            if (StringUtil.isNotBlank(prevCommit)) {
+            if (StringUtil.isNotBlank(prevCommit) && isSameSource(prevSourceRef, currentSourceRef)) {
                 fromCommitId = repository.resolve(prevCommit);
             } else {
+                if (StringUtil.isNotBlank(prevCommit) && StringUtil.isNotBlank(prevSourceRef)) {
+                    logger.info("Source configuration changed ('{}' -> '{}'); performing a full reindex instead of an incremental diff.",
+                            prevSourceRef, currentSourceRef);
+                }
                 fromCommitId = null;
             }
-            final ObjectId toCommitId = repository.resolve(commitId);
+            final ObjectId toCommitId = resolveToCommitId(repository, commitId, resolvedCommitId);
             configMap.put(CURRENT_COMMIT_ID, toCommitId);
             try (DiffFormatter diffFormatter = new DiffFormatter(null)) {
                 diffFormatter.setRepository(repository);
@@ -254,20 +339,30 @@ public class GitDataStore extends AbstractDataStore {
                 });
             }
             if (dataConfig != null) {
-                updateDataConfig(dataConfig, toCommitId);
+                updateDataConfig(dataConfig, currentSourceRef, toCommitId);
             }
         } catch (final Exception e) {
-            throw new DataStoreException(e);
+            // Redact both the DataStoreException's own top-level message AND the wrapped cause chain: JGit's
+            // TransportException (thrown by TransportHttp/TransportGitSsh on auth/network failures) embeds the
+            // target URI in its own getMessage() with only the password stripped (via URIish#setPass(null)) --
+            // the username (e.g. a PAT-style credential used as username) is left in. That cause message is what
+            // log4j2 prints as "Caused by:" and what failure-url reporting persists, so redactCredentialsInChain
+            // scrubs every level of the chain before it is attached.
+            throw new DataStoreException("Failed to crawl Git repository " + redactUrl(uri), redactCredentialsInChain(e));
         } finally {
             try {
                 repository.close();
             } finally {
-                final File gitRepoPath = (File) configMap.get(TEMP_REPOSITORY_PATH);
-                if (gitRepoPath != null) {
-                    try (Stream<Path> walk = Files.walk(gitRepoPath.toPath())) {
-                        walk.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
-                    } catch (final IOException e) {
-                        logger.warn("Failed to delete {}.", gitRepoPath.getAbsolutePath(), e);
+                try {
+                    releaseRepositoryLock(configMap);
+                } finally {
+                    final File gitRepoPath = (File) configMap.get(TEMP_REPOSITORY_PATH);
+                    if (gitRepoPath != null) {
+                        try (Stream<Path> walk = Files.walk(gitRepoPath.toPath())) {
+                            walk.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
+                        } catch (final IOException e) {
+                            logger.warn("Failed to delete {}.", gitRepoPath.getAbsolutePath(), e);
+                        }
                     }
                 }
             }
@@ -291,33 +386,462 @@ public class GitDataStore extends AbstractDataStore {
     }
 
     /**
-     * Updates the data configuration with the new commit ID.
+     * Updates the data configuration with the new commit ID and source ref.
+     * <p>
+     * Both {@link #PREV_COMMIT_ID} and {@link #PREV_SOURCE_REF} are written back using the same
+     * "update in place if the key already exists, otherwise append" strategy so that a repeat run
+     * can detect when the {@code uri}/branch has changed and fall back to a full reindex.
+     * </p>
      *
      * @param dataConfig The data configuration.
+     * @param sourceRef The current source ref ({@code uri + "#" + resolved commit ref}).
      * @param toCommitId The new commit ID.
      */
-    protected void updateDataConfig(final DataConfig dataConfig, final ObjectId toCommitId) {
-        final Map<String, String> handlerParameterMap = dataConfig.getHandlerParameterMap();
-        final boolean hasPrevCommitId = handlerParameterMap.containsKey(PREV_COMMIT_ID);
-        final String paramStr;
-        if (hasPrevCommitId) {
-            paramStr = handlerParameterMap.entrySet().stream().map(e -> {
-                if (PREV_COMMIT_ID.equals(e.getKey())) {
-                    return e.getKey() + "=" + toCommitId.name();
-                }
-                return e.getKey() + "=" + e.getValue();
-            }).collect(Collectors.joining("\n"));
-        } else {
-            final String existing =
-                    handlerParameterMap.entrySet().stream().map(e -> e.getKey() + "=" + e.getValue()).collect(Collectors.joining("\n"));
-            paramStr = existing + "\n" + PREV_COMMIT_ID + "=" + toCommitId.name();
-        }
+    protected void updateDataConfig(final DataConfig dataConfig, final String sourceRef, final ObjectId toCommitId) {
+        final String paramStr = buildHandlerParameter(dataConfig.getHandlerParameterMap(), toCommitId.name(), sourceRef);
         dataConfig.setHandlerParameter(paramStr);
         if (logger.isDebugEnabled()) {
-            logger.debug("Updating data config by {}.", paramStr);
+            // Do NOT log paramStr: it is the full handlerParameter string and carries the cleartext password
+            // and the raw uri userinfo. Log only non-sensitive identifiers; sourceRef is already redacted
+            // (it is the currentSourceRef built with redactUrl(uri) in storeData).
+            logger.debug("Updating data config {} to commit {} (source_ref={}).", dataConfig.getId(), toCommitId.name(), sourceRef);
         }
         ComponentUtil.getComponent(DataConfigBhv.class).update(dataConfig);
         logger.info("Updated DataConfig: {}", dataConfig.getId());
+    }
+
+    /**
+     * Builds the {@code handlerParameter} string with {@link #PREV_COMMIT_ID} and {@link #PREV_SOURCE_REF}
+     * applied using an "update in place if the key already exists, otherwise append" strategy so that
+     * existing keys keep their position and are never duplicated.
+     *
+     * @param handlerParameterMap The current handler parameter map.
+     * @param prevCommitId The commit ID to persist as {@link #PREV_COMMIT_ID}.
+     * @param prevSourceRef The source ref to persist as {@link #PREV_SOURCE_REF}.
+     * @return The rebuilt {@code handlerParameter} string.
+     */
+    protected String buildHandlerParameter(final Map<String, String> handlerParameterMap, final String prevCommitId,
+            final String prevSourceRef) {
+        final Map<String, String> newValues = new LinkedHashMap<>();
+        newValues.put(PREV_COMMIT_ID, prevCommitId);
+        newValues.put(PREV_SOURCE_REF, prevSourceRef);
+
+        final StringBuilder buf = new StringBuilder();
+        handlerParameterMap.forEach((key, value) -> {
+            if (buf.length() > 0) {
+                buf.append('\n');
+            }
+            buf.append(key).append('=').append(newValues.getOrDefault(key, value));
+        });
+        newValues.forEach((key, value) -> {
+            if (!handlerParameterMap.containsKey(key)) {
+                if (buf.length() > 0) {
+                    buf.append('\n');
+                }
+                buf.append(key).append('=').append(value);
+            }
+        });
+        return buf.toString();
+    }
+
+    /**
+     * Resolves the commit reference to use for checkout and diffing.
+     * <p>
+     * When {@code commitId} defaults to {@link org.eclipse.jgit.lib.Constants#HEAD} (or is blank), the
+     * remote's advertised {@code HEAD} is inspected to determine the actual default branch (e.g.
+     * {@code refs/heads/main}). {@code FetchCommand} does not update the local {@code HEAD}, so if the
+     * advertised {@code HEAD} is symbolic the local {@code HEAD} is linked to that branch (mirroring
+     * {@code CloneCommand}); this lets {@link #hasCommitLogs(Map)} resolve correctly on subsequent runs
+     * against a persistent {@code repository_path}.
+     * </p>
+     * <p>
+     * Some transports/servers don't advertise the git symref capability for {@code HEAD}, in which case the
+     * advertised {@code HEAD} ref is not symbolic. Mirroring JGit's own
+     * {@code CloneCommand#findBranchToCheckout(FetchResult)}, {@code refs/heads/*} is scanned for a ref whose
+     * object id matches {@code HEAD}'s object id so a real branch name can still be identified by content; a
+     * bare commit SHA is used only if genuinely nothing matches (detached/anonymous history). A raw SHA here
+     * would otherwise make {@link #isSameSource(String, String)} flip-flop across runs with no actual
+     * branch/uri change, since the SHA moves as the branch advances.
+     * </p>
+     *
+     * @param repository The Git repository.
+     * @param fetchResult The result of the fetch operation.
+     * @param commitId The configured commit ID.
+     * @return The resolved commit reference to use for checkout and resolution.
+     * @throws IOException If updating the local {@code HEAD} fails.
+     */
+    protected String resolveDefaultBranch(final Repository repository, final FetchResult fetchResult, final String commitId)
+            throws IOException {
+        if (StringUtil.isNotBlank(commitId) && !org.eclipse.jgit.lib.Constants.HEAD.equals(commitId)) {
+            return commitId;
+        }
+        final Ref headRef = fetchResult.getAdvertisedRef(org.eclipse.jgit.lib.Constants.HEAD);
+        if (headRef == null) {
+            return commitId;
+        }
+        if (headRef.isSymbolic()) {
+            final String targetName = headRef.getTarget().getName();
+            linkLocalHead(repository, targetName);
+            return targetName;
+        }
+        final String matchedBranch = findAdvertisedBranchByObjectId(fetchResult.getAdvertisedRefs(), headRef.getObjectId());
+        if (matchedBranch != null) {
+            linkLocalHead(repository, matchedBranch);
+            return matchedBranch;
+        }
+        return headRef.getObjectId().name();
+    }
+
+    /**
+     * Links the local {@code HEAD} to the given target ref name, without writing a reflog entry.
+     *
+     * @param repository The Git repository.
+     * @param targetName The ref name to link {@code HEAD} to (e.g. {@code refs/heads/main}).
+     * @throws IOException If updating the local {@code HEAD} fails.
+     */
+    private void linkLocalHead(final Repository repository, final String targetName) throws IOException {
+        final RefUpdate newHead = repository.updateRef(org.eclipse.jgit.lib.Constants.HEAD);
+        newHead.disableRefLog();
+        newHead.link(targetName);
+    }
+
+    /**
+     * Scans the given advertised refs for one under {@code refs/heads/} whose object id matches {@code headId}.
+     * Used by {@link #resolveDefaultBranch(Repository, FetchResult, String)} to identify a branch name by
+     * content when the advertised {@code HEAD} is not symbolic. This is similar in intent to JGit's own
+     * {@code CloneCommand#findBranchToCheckout(FetchResult)}, but does NOT replicate its tiebreak: when several
+     * advertised branches share {@code HEAD}'s object id, JGit specially prefers {@code refs/heads/master},
+     * whereas this returns the first match in advertised-ref order. That is fine here because advertised-ref
+     * order is deterministic (server-advertised), not a source of run-to-run flapping; it only changes which
+     * branch name is picked on a genuine tie.
+     *
+     * @param advertisedRefs The refs advertised by the remote.
+     * @param headId The object id that the remote's {@code HEAD} points at, or {@code null}.
+     * @return The name of a matching {@code refs/heads/*} ref, or {@code null} if none matches.
+     */
+    protected String findAdvertisedBranchByObjectId(final Iterable<Ref> advertisedRefs, final ObjectId headId) {
+        if (headId == null) {
+            return null;
+        }
+        for (final Ref ref : advertisedRefs) {
+            final String name = ref.getName();
+            if (name != null && name.startsWith(org.eclipse.jgit.lib.Constants.R_HEADS) && headId.equals(ref.getObjectId())) {
+                return name;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Resolves the target commit and fails fast if it cannot be resolved.
+     * <p>
+     * Resolving must happen before any diff/delete work: a {@code null} target would otherwise be treated
+     * by JGit's diff as an empty tree, marking every previously-tracked file as a deletion.
+     * </p>
+     *
+     * @param repository The Git repository.
+     * @param commitId The configured commit ID (used only for the error message).
+     * @param resolvedCommitId The resolved commit reference to look up.
+     * @return The resolved target commit ID (never {@code null}).
+     * @throws IOException If resolution fails at the I/O level.
+     */
+    protected ObjectId resolveToCommitId(final Repository repository, final String commitId, final String resolvedCommitId)
+            throws IOException {
+        final ObjectId toCommitId = repository.resolve(resolvedCommitId);
+        if (toCommitId == null) {
+            // Report the ref that actually failed to resolve (resolvedCommitId), not the configured commit_id:
+            // e.g. a configured "HEAD" resolves to "refs/heads/main", and it is that resolved ref which was
+            // unresolvable. The original configured value is still included for context.
+            throw new DataStoreException("Could not resolve commit_id '" + resolvedCommitId + "' (configured commit_id was '" + commitId
+                    + "'). The branch/tag may not exist, or may have been renamed/deleted upstream.");
+        }
+        return toCommitId;
+    }
+
+    /**
+     * Determines whether the recorded source ref matches the current run's source ref.
+     * <p>
+     * A blank {@code prevSourceRef} (e.g. a config that predates this tracking param, or a manually-set
+     * {@code prev_commit_id}) is treated as a match so that existing incremental behavior is preserved.
+     * </p>
+     *
+     * @param prevSourceRef The source ref recorded on the previous run.
+     * @param currentSourceRef The source ref of the current run.
+     * @return {@code true} if the previous {@code prev_commit_id} can be trusted for an incremental diff.
+     */
+    protected boolean isSameSource(final String prevSourceRef, final String currentSourceRef) {
+        if (StringUtil.isBlank(prevSourceRef)) {
+            return true;
+        }
+        return prevSourceRef.equals(currentSourceRef);
+    }
+
+    /**
+     * Acquires an OS-level advisory lock on a persistent {@code repository_path} and removes any stale
+     * JGit lock files.
+     * <p>
+     * The marker file sits next to {@code .git} so it is never touched by the stale-lock scan. Because the
+     * OS releases the {@link FileLock} automatically when the holding process dies (including via SIGKILL),
+     * a run killed a moment ago will not block the next run, whereas a genuinely concurrent live run will.
+     * Once the lock is held we are the sole owner of the directory, so any {@code *.lock} file under
+     * {@code .git} is guaranteed stale and is deleted.
+     * </p>
+     *
+     * @param repositoryPath The persistent repository directory.
+     * @param configMap The configuration map; the lock and channel are stored here for later release.
+     */
+    protected void lockRepositoryPath(final File repositoryPath, final Map<String, Object> configMap) {
+        final File markerFile = new File(repositoryPath, LOCK_FILE_NAME);
+        FileChannel channel = null;
+        FileLock lock = null;
+        try {
+            channel = FileChannel.open(markerFile.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            lock = channel.tryLock();
+        } catch (final OverlappingFileLockException e) {
+            // tryLock() throws instead of returning null when this JVM already holds an overlapping lock.
+            lock = null;
+        } catch (final IOException e) {
+            closeChannelQuietly(channel);
+            throw new DataStoreException("Failed to acquire a lock on repository_path " + repositoryPath.getAbsolutePath(), e);
+        }
+        if (lock == null) {
+            closeChannelQuietly(channel);
+            throw new DataStoreException("Another crawl appears to be using repository_path '" + repositoryPath.getAbsolutePath()
+                    + "'. If no crawl is actually running, a stale lock file may need manual cleanup: " + markerFile.getAbsolutePath());
+        }
+        configMap.put(REPOSITORY_LOCK_CHANNEL, channel);
+        configMap.put(REPOSITORY_LOCK, lock);
+        try {
+            deleteStaleLockFiles(new File(repositoryPath, ".git"));
+        } catch (final RuntimeException | Error e) {
+            // deleteStaleLockFiles already catches the IOException/UncheckedIOException that Files.walk can
+            // throw; any OTHER throwable (e.g. a SecurityException under a SecurityManager) would otherwise
+            // escape before the lock is merged into the caller's finally-guarded configMap, leaking the lock
+            // (and its channel) for the life of the JVM -- exactly the permanent crawl-blocking DoS this
+            // locking exists to prevent. Release on any throw and rethrow.
+            releaseRepositoryLock(configMap);
+            throw e;
+        }
+    }
+
+    /**
+     * Deletes stale JGit {@code *.lock} files under the given {@code .git} directory. Must only be called
+     * while holding the {@link #lockRepositoryPath} advisory lock, which guarantees the files are stale.
+     * <p>
+     * This scan is best-effort and must never propagate a failure: it runs immediately after the advisory
+     * lock has already been acquired and stored by the caller, with no surrounding try/catch, so an
+     * uncaught exception here would skip the caller's cleanup and leak that lock for the life of the JVM.
+     * Individual file {@code delete()} failures are already just logged; both {@link IOException} (thrown by
+     * {@link Files#walk(Path, java.nio.file.FileVisitOption...)} itself) and {@link UncheckedIOException}
+     * (which {@code Files.walk()}'s returned {@link Stream} can throw mid-traversal, e.g. on a
+     * permission-denied or concurrently-deleted subdirectory) are therefore caught and logged rather than
+     * allowed to escape.
+     * </p>
+     *
+     * @param gitDir The {@code .git} directory to scan.
+     */
+    protected void deleteStaleLockFiles(final File gitDir) {
+        if (gitDir == null || !gitDir.isDirectory()) {
+            return;
+        }
+        try (Stream<Path> walk = Files.walk(gitDir.toPath())) {
+            walk.filter(Files::isRegularFile).filter(p -> p.getFileName().toString().endsWith(".lock")).forEach(p -> {
+                final File lockFile = p.toFile();
+                logger.warn("Removing stale Git lock file (likely left by a previously interrupted crawl): {}", lockFile.getAbsolutePath());
+                if (!lockFile.delete()) {
+                    logger.warn("Failed to delete stale Git lock file: {}", lockFile.getAbsolutePath());
+                }
+            });
+        } catch (final IOException e) {
+            logger.warn("Failed to scan for stale Git lock files under {}.", gitDir.getAbsolutePath(), e);
+        } catch (final UncheckedIOException e) {
+            // Thrown by the Stream during traversal (not by Files.walk() itself), so it is not an IOException
+            // and would otherwise bypass the catch above. Log the wrapped cause, same as the IOException case.
+            logger.warn("Failed to scan for stale Git lock files under {}.", gitDir.getAbsolutePath(),
+                    e.getCause() != null ? e.getCause() : e);
+        }
+    }
+
+    /**
+     * Releases the repository lock and closes its channel, if present. Best-effort: the OS releases the
+     * lock anyway if the process is killed.
+     *
+     * @param configMap The configuration map holding the lock and channel.
+     */
+    protected void releaseRepositoryLock(final Map<String, Object> configMap) {
+        final FileLock lock = (FileLock) configMap.get(REPOSITORY_LOCK);
+        if (lock != null) {
+            try {
+                lock.release();
+            } catch (final IOException e) {
+                logger.debug("Failed to release the repository lock.", e);
+            }
+        }
+        closeChannelQuietly((FileChannel) configMap.get(REPOSITORY_LOCK_CHANNEL));
+    }
+
+    private void closeChannelQuietly(final FileChannel channel) {
+        if (channel != null) {
+            try {
+                channel.close();
+            } catch (final IOException e) {
+                logger.debug("Failed to close the repository lock channel.", e);
+            }
+        }
+    }
+
+    /** Matches a scheme + {@code "://"} prefix (e.g. {@code https://}); used by {@link #maskConservatively(String)}
+     *  to separate the scheme from the remainder of an otherwise-unparseable URL. */
+    private static final Pattern SCHEME_PREFIX_PATTERN = Pattern.compile("^[A-Za-z][A-Za-z0-9+.-]*://");
+
+    /**
+     * Redacts any user-info (e.g. {@code user:token@}) embedded in a Git URI so it is safe to log, persist in
+     * {@link #PREV_SOURCE_REF}, and index (see {@code resultMap.put("uri", ...)} in {@link #processFile}).
+     * <p>
+     * This method is fail-CLOSED: on any parse ambiguity it masks conservatively rather than ever returning
+     * credential-bearing input unchanged. {@link java.net.URI} is deliberately NOT used here: it is a strict
+     * RFC-3986 parser that throws {@link URISyntaxException} on scp-style Git remotes ({@code user@host:path})
+     * and on unescaped reserved characters (e.g. {@code @}, {@code /}) that commonly appear in real Git
+     * tokens/passwords -- and a naive implementation would return the raw, unredacted url on any such parse
+     * failure. {@link URIish} is used instead: it is already a project dependency (used elsewhere in this file
+     * for the actual git operations) and is far more lenient with Git's real-world remote URL syntax.
+     * </p>
+     * <p>
+     * Known residual limitation: {@link URIish} itself can misparse an authority containing an unescaped
+     * {@code /} inside the password by folding the whole authority into the path instead of throwing; this is
+     * detected here (a scheme was recognized but no host was) and handled by {@link #maskConservatively(String)}.
+     * The equivalent failure for a schemeless scp-style URL (e.g. {@code user:pa/ss@host:path}) is not
+     * specifically detected, since real scp-style Git remotes authenticate via SSH keys rather than
+     * URL-embedded passwords, making that combination exotic in practice.
+     * </p>
+     *
+     * @param url The Git URI.
+     * @return The URI with any user-info component removed, or a conservatively-masked string if the input
+     *         could not be confidently parsed.
+     */
+    protected String redactUrl(final String url) {
+        if (StringUtil.isBlank(url)) {
+            return url;
+        }
+        try {
+            final URIish parsed = new URIish(url);
+            if (parsed.getUser() != null || parsed.getPass() != null) {
+                return parsed.setUser(null).setPass(null).toString();
+            }
+            if ((parsed.getScheme() != null || SCHEME_PREFIX_PATTERN.matcher(url).find()) && parsed.getHost() == null) {
+                // A scheme was recognized but no host was -- typically because an unescaped '/' inside a
+                // password broke authority parsing and the whole authority (including any credentials) was
+                // folded into the path instead of being reported as user/pass. Treat this as unparseable.
+                //
+                // The SCHEME_PREFIX_PATTERN check additionally covers an uppercase/mixed-case scheme (e.g.
+                // "HTTPS://"): URIish's internal SCHEME_P regex is lowercase-only, so it fails to match the
+                // normal FULL_URI pattern for such input and silently falls through to the lenient
+                // LOCAL_FILE catch-all, which treats the whole string as an opaque local path -- scheme,
+                // host, user and pass all come back null. Matching the original input against
+                // SCHEME_PREFIX_PATTERN (case-insensitive by construction) detects that case too, without
+                // misrouting a genuine schemeless local path (which never matches the pattern).
+                return maskConservatively(url);
+            }
+            return url;
+        } catch (final URISyntaxException | RuntimeException e) {
+            // RuntimeException covers cases like NumberFormatException on an out-of-range port, which
+            // URIish's constructor can throw without wrapping it as a URISyntaxException. Never fall through
+            // to returning the raw url.
+            return maskConservatively(url);
+        }
+    }
+
+    /**
+     * Conservatively masks anything that looks like embedded user-info in a URL that {@link URIish} could not
+     * confidently parse. Strips everything between an optional {@code scheme://} prefix and the last {@code @}
+     * found afterward (or, for scp-style/schemeless input, the last {@code @} anywhere in the string), on the
+     * assumption that a Git remote URL never legitimately needs a bare {@code @} in that position other than as
+     * a user-info separator. If no {@code @} is found there, there is nothing recognizable to strip and the
+     * input is returned unchanged.
+     *
+     * @param url The url to mask.
+     * @return The masked url.
+     */
+    protected String maskConservatively(final String url) {
+        final Matcher schemeMatcher = SCHEME_PREFIX_PATTERN.matcher(url);
+        final String prefix;
+        final String rest;
+        if (schemeMatcher.find()) {
+            prefix = schemeMatcher.group();
+            rest = url.substring(prefix.length());
+        } else {
+            prefix = StringUtil.EMPTY;
+            rest = url;
+        }
+        final int lastAt = rest.lastIndexOf('@');
+        if (lastAt < 0) {
+            return prefix + rest;
+        }
+        return prefix + rest.substring(lastAt + 1);
+    }
+
+    /** Matches a scheme + {@code "://"} + userinfo + {@code "@"} occurring anywhere in free text (e.g. inside a
+     *  JGit exception message), so the userinfo can be stripped without disturbing the rest of the message.
+     *  Used by {@link #redactCredentials(String)}. */
+    private static final Pattern EMBEDDED_CREDENTIAL_PATTERN = Pattern.compile("([A-Za-z][A-Za-z0-9+.-]*://)[^\\s/@]+@");
+
+    /** Safety bound on the cause-chain recursion in {@link #redactCredentialsInChain(Throwable)}: real JGit
+     *  chains are only a handful deep, but a cyclic chain (constructible via {@link Throwable#initCause(Throwable)},
+     *  e.g. {@code a -> b -> a}, which rejects only direct self-reference) would otherwise recurse forever. At
+     *  this depth the remaining cause is dropped rather than attached raw, so the result stays safe to
+     *  log/persist even in that never-seen-in-practice case. */
+    private static final int MAX_CAUSE_CHAIN_DEPTH = 20;
+
+    /**
+     * Strips any {@code scheme://userinfo@} occurring anywhere within free-form text (e.g. an exception
+     * message), leaving the scheme and the rest of the text untouched. Unlike {@link #redactUrl(String)}, this
+     * does not require the whole input to be a single URL: JGit exception messages typically embed the target
+     * URI (with the password already stripped but the username left in) inside a larger sentence such as
+     * {@code "https://user@host/repo.git: Connection refused"}.
+     *
+     * @param message The text to scrub.
+     * @return The text with any embedded {@code scheme://userinfo@} stripped, or the input unchanged if it
+     *         contained none (or was blank/{@code null}).
+     */
+    protected String redactCredentials(final String message) {
+        if (StringUtil.isBlank(message)) {
+            return message;
+        }
+        return EMBEDDED_CREDENTIAL_PATTERN.matcher(message).replaceAll("$1");
+    }
+
+    /**
+     * Returns a copy of the given throwable's cause chain with any embedded Git-URL user-info (see
+     * {@link #redactCredentials(String)}) stripped from every message in the chain, so it is safe to log or
+     * persist to a failure-url record. Preserves each level's original stack trace and embeds the original
+     * class name in the replacement message (so logs still show what type of error it was). A chain that needed
+     * no redaction anywhere is returned as the same instance (no pointless wrapping).
+     *
+     * @param throwable The throwable (possibly with a cause chain) to sanitize.
+     * @return A sanitized copy, or the original instance if nothing needed redaction, or {@code null} if the
+     *         input was {@code null}.
+     */
+    protected Throwable redactCredentialsInChain(final Throwable throwable) {
+        return redactCredentialsInChain(throwable, 0);
+    }
+
+    private Throwable redactCredentialsInChain(final Throwable throwable, final int depth) {
+        if (throwable == null) {
+            return null;
+        }
+        final String message = throwable.getMessage();
+        final String redactedMessage = redactCredentials(message);
+        final Throwable originalCause = throwable.getCause();
+        // Stop recursing at MAX_CAUSE_CHAIN_DEPTH and drop the remaining cause: a cyclic chain would otherwise
+        // recurse forever, and dropping the deeper cause keeps the result safe to log/persist even then.
+        final Throwable redactedCause = depth >= MAX_CAUSE_CHAIN_DEPTH ? null : redactCredentialsInChain(originalCause, depth + 1);
+        if (Objects.equals(message, redactedMessage) && redactedCause == originalCause) {
+            return throwable;
+        }
+        final RuntimeException sanitized = new RuntimeException(
+                throwable.getClass().getName() + (redactedMessage != null ? ": " + redactedMessage : StringUtil.EMPTY), redactedCause);
+        sanitized.setStackTrace(throwable.getStackTrace());
+        return sanitized;
     }
 
     /**
@@ -357,7 +881,7 @@ public class GitDataStore extends AbstractDataStore {
         final String uri = (String) configMap.get(URI);
         final DiffEntry diffEntry = (DiffEntry) configMap.get(DIFF_ENTRY);
         final String path = diffEntry.getNewPath();
-        final StatsKeyObject statsKey = new StatsKeyObject(uri);
+        final StatsKeyObject statsKey = new StatsKeyObject(redactUrl(uri));
         paramMap.put(Constants.CRAWLER_STATS_KEY, statsKey);
         try {
             crawlerStatsHelper.begin(statsKey);
@@ -367,6 +891,8 @@ public class GitDataStore extends AbstractDataStore {
             logger.info("Crawling Path: {}", path);
 
             final Map<String, Object> resultMap = new LinkedHashMap<>(paramMap.asMap());
+            resultMap.remove(USERNAME);
+            resultMap.remove(PASSWORD);
             final Repository repository = (Repository) configMap.get(REPOSITORY);
             final ObjectLoader objectLoader = repository.open(diffEntry.getNewId().toObjectId());
             final long size = objectLoader.getSize();
@@ -400,14 +926,14 @@ public class GitDataStore extends AbstractDataStore {
                         throw e;
                     }
                     if (logger.isDebugEnabled()) {
-                        logger.warn("Could not get a text from {}.", uri, e);
+                        logger.warn("Could not get a text from {}.", redactUrl(uri), e);
                     } else {
-                        logger.warn("Could not get a text from {}. {}", uri, e.getMessage());
+                        logger.warn("Could not get a text from {}. {}", redactUrl(uri), e.getMessage());
                     }
                 }
 
                 resultMap.put("url", getUrl(paramMap, path));
-                resultMap.put("uri", uri);
+                resultMap.put("uri", redactUrl(uri));
                 resultMap.put("path", path);
                 resultMap.put("name", name);
                 resultMap.put("crawlingConfig", dataConfig);
@@ -418,7 +944,13 @@ public class GitDataStore extends AbstractDataStore {
                 crawlerStatsHelper.record(statsKey, StatsAction.PREPARED);
 
                 if (logger.isDebugEnabled()) {
-                    logger.debug("resultMap: {}", resultMap);
+                    // resultMap holds the raw DataConfig under "crawlingConfig"; DataConfig.toString() emits the
+                    // un-redacted handlerParameter (uri userinfo, and a cleartext password after a write-back), so
+                    // log a copy without it -- the other credential-bearing entries (username/password/uri) were
+                    // already removed/redacted above.
+                    final Map<String, Object> logMap = new LinkedHashMap<>(resultMap);
+                    logMap.remove("crawlingConfig");
+                    logger.debug("resultMap: {}", logMap);
                 }
 
                 final String scriptType = getScriptType(paramMap);
@@ -450,7 +982,11 @@ public class GitDataStore extends AbstractDataStore {
                 }
             }
         } catch (final CrawlingAccessException e) {
-            logger.warn("Crawling Access Exception at : {}", dataMap, e);
+            // The exception message may embed a Git URL with credentials (see redactCredentials); scrub the
+            // chain before it is logged or persisted. The original objects are still used below for the
+            // instanceof/errorName checks, which only read class names (never sensitive).
+            final Throwable redactedException = redactCredentialsInChain(e);
+            logger.warn("Crawling Access Exception at : {}", dataMap, redactedException);
 
             Throwable target = e;
             if (target instanceof MultipleCrawlingAccessException) {
@@ -475,16 +1011,18 @@ public class GitDataStore extends AbstractDataStore {
                     throw e;
                 }
             } else {
-                url = uri + ":" + path;
+                url = redactUrl(uri) + ":" + path;
             }
             final FailureUrlService failureUrlService = ComponentUtil.getComponent(FailureUrlService.class);
-            failureUrlService.store(dataConfig, errorName, url, target);
+            failureUrlService.store(dataConfig, errorName, url, redactCredentialsInChain(target));
             crawlerStatsHelper.record(statsKey, StatsAction.ACCESS_EXCEPTION);
         } catch (final Throwable t) {
-            logger.warn("Crawling Access Exception at : {}", dataMap, t);
-            final String url = uri + ":" + path;
+            // Scrub any credential-bearing Git URL out of the message chain before logging/persisting it.
+            final Throwable redactedThrowable = redactCredentialsInChain(t);
+            logger.warn("Crawling Access Exception at : {}", dataMap, redactedThrowable);
+            final String url = redactUrl(uri) + ":" + path;
             final FailureUrlService failureUrlService = ComponentUtil.getComponent(FailureUrlService.class);
-            failureUrlService.store(dataConfig, t.getClass().getCanonicalName(), url, t);
+            failureUrlService.store(dataConfig, t.getClass().getCanonicalName(), url, redactedThrowable);
 
             final long readInterval = (Long) configMap.get(READ_INTERVAL);
             if (readInterval > 0) {
@@ -504,8 +1042,9 @@ public class GitDataStore extends AbstractDataStore {
      */
     protected boolean hasCommitLogs(final Map<String, Object> configMap) {
         final Git git = (Git) configMap.get(GIT);
-        try {
-            git.log().call();
+        // LogCommand.call() returns its own internal RevWalk (it ends with "return walk;") and never closes it,
+        // so the returned Iterable can be cast back to that RevWalk and closed to avoid leaking pack-file handles.
+        try (RevWalk revWalk = (RevWalk) git.log().call()) {
             return true;
         } catch (final Exception e) {
             if (logger.isDebugEnabled()) {
@@ -527,11 +1066,19 @@ public class GitDataStore extends AbstractDataStore {
     protected RevCommit getRevCommit(final Map<String, Object> configMap, final String path) throws GitAPIException, IOException {
         final Git git = (Git) configMap.get(GIT);
         final ObjectId currentCommitId = (ObjectId) configMap.get(CURRENT_COMMIT_ID);
-        final Iterator<RevCommit> revCommitIter = git.log().add(currentCommitId).addPath(path).setMaxCount(1).call().iterator();
-        if (!revCommitIter.hasNext()) {
-            throw new DataStoreException("Failed to parse git log for " + path);
+        final Iterable<RevCommit> revCommits = git.log().add(currentCommitId).addPath(path).setMaxCount(1).call();
+        // LogCommand.call() returns its own internal RevWalk (it ends with "return walk;") and never closes it,
+        // so the returned Iterable can be cast back to that RevWalk and closed to avoid leaking pack-file handles.
+        try (RevWalk revWalk = (RevWalk) revCommits) {
+            final Iterator<RevCommit> revCommitIter = revCommits.iterator();
+            if (!revCommitIter.hasNext()) {
+                throw new DataStoreException("Failed to parse git log for " + path);
+            }
+            final RevCommit revCommit = revCommitIter.next();
+            // Eagerly load the commit body so author/committer/timestamp remain readable after the walk is closed.
+            revWalk.parseBody(revCommit);
+            return revCommit;
         }
-        return revCommitIter.next();
     }
 
     /**
@@ -587,12 +1134,31 @@ public class GitDataStore extends AbstractDataStore {
         } else {
             try {
                 final File repoFile = new File(repositoryPath);
-                final boolean exists = repoFile.exists();
-                if (!exists) {
+                if (!repoFile.exists()) {
                     repoFile.mkdirs();
                 }
-                final Repository repository = FileRepositoryBuilder.create(new File(repositoryPath, ".git"));
-                if (!exists) {
+                // Checked on the .git directory itself, not the parent repoFile: storeData() may already have
+                // created the parent directory (to have somewhere to put the advisory lock marker file) before
+                // this method runs, so repoFile.exists() alone would no longer reliably indicate whether this
+                // is a brand-new repository that still needs repository.create().
+                final File gitDir = new File(repositoryPath, ".git");
+                // A run killed mid-initialization can leave .git as a partial skeleton. JGit's
+                // repository.create() writes .git/config LAST (its final cfg.save()) and refuses to re-run
+                // once config exists, so config's presence reliably marks a completed initialization and its
+                // absence marks an interrupted one. Because create() also runs BEFORE any fetch, a .git without
+                // config can never contain fetched data, so discarding it loses nothing. Delete the partial
+                // directory (only .git, never repositoryPath, whose advisory lock marker must survive) so the
+                // repository is re-created below -- a plain re-create() alone cannot repair it, as refs.create()
+                // throws on the already-existing refs/. A completed repo keeps its config and is left untouched.
+                if (gitDir.exists() && !new File(gitDir, org.eclipse.jgit.lib.Constants.CONFIG).exists()) {
+                    logger.warn("Removing an incomplete Git repository left by a previously interrupted crawl: {}",
+                            gitDir.getAbsolutePath());
+                    org.eclipse.jgit.util.FileUtils.delete(gitDir,
+                            org.eclipse.jgit.util.FileUtils.RECURSIVE | org.eclipse.jgit.util.FileUtils.SKIP_MISSING);
+                }
+                final boolean gitDirExists = gitDir.exists();
+                final Repository repository = FileRepositoryBuilder.create(gitDir);
+                if (!gitDirExists) {
                     repository.create();
                 }
                 configMap.put(REPOSITORY, repository);
