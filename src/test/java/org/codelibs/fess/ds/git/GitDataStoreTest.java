@@ -355,6 +355,52 @@ public class GitDataStoreTest extends UnitDsTestCase {
         }
     }
 
+    // Fix (this review): deleteStaleLockFiles() catches only the IOException/UncheckedIOException family that
+    // Files.walk() can throw. Any OTHER throwable it raises (e.g. a SecurityException under a SecurityManager)
+    // would, pre-fix, escape lockRepositoryPath() -- which has already stored the just-acquired advisory lock
+    // in the caller's map and has no surrounding try/catch in storeData() -- and leak that FileLock for the
+    // life of the JVM, blocking every future crawl of this repository_path. lockRepositoryPath() must release
+    // the lock on ANY throw from the stale-lock scan, not just on the IOException family.
+    @Test
+    public void test_storeData_staleLockScanRuntimeErrorDoesNotLeakLock() throws Exception {
+        final File persistent = Files.createTempDirectory("fess-ds-git-persist-").toFile();
+        tempDirs.add(persistent);
+
+        final DataStoreParams params = new DataStoreParams();
+        params.put("uri", "https://example.invalid/repo.git"); // never reached: the scan fails first
+        params.put("repository_path", persistent.getAbsolutePath());
+
+        final GitDataStore dataStore = new GitDataStore() {
+            @Override
+            protected UrlFilter getUrlFilter(final DataStoreParams paramMap) {
+                return new MockUrlFilter();
+            }
+
+            @Override
+            protected void deleteStaleLockFiles(final File gitDir) {
+                // A non-IOException throwable from the scan (the IOException family is already handled inside
+                // deleteStaleLockFiles); this stands in for e.g. a SecurityException.
+                throw new IllegalStateException("simulated non-IOException scan failure");
+            }
+        };
+
+        try {
+            dataStore.storeData(null, null, params, null, null);
+            fail("Expected IllegalStateException");
+        } catch (final IllegalStateException e) {
+            assertEquals("simulated non-IOException scan failure", e.getMessage());
+        }
+
+        // The advisory lock must have been released despite the non-IOException scan failure: a fresh,
+        // independent lock attempt on the same marker (from this same JVM) must succeed. Pre-fix, the lock
+        // leaks and tryLock() would throw OverlappingFileLockException / return null.
+        final File marker = new File(persistent, ".fess-ds-git.lock");
+        try (FileChannel channel = FileChannel.open(marker.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                FileLock lock = channel.tryLock()) {
+            assertNotNull(lock);
+        }
+    }
+
     // Fix #5: a first run killed mid-initialization can leave repository_path/.git as a partial skeleton.
     // JGit's repository.create() writes .git/config LAST (cfg.save()) and refuses to re-run once config
     // exists, so an interrupted create() leaves a .git that JGit cannot open (no object database / HEAD /

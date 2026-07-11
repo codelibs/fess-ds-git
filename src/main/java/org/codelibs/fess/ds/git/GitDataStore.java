@@ -159,6 +159,13 @@ public class GitDataStore extends AbstractDataStore {
     /** Parameter key for the repository path. */
     protected static final String REPOSITORY_PATH = "repository_path";
 
+    /**
+     * Parameter key for Fess's framework-level "delete old documents" behavior. This is handled by Fess's
+     * crawling infrastructure ({@code DataIndexHelper}), not by this plugin; it is read here only to warn when
+     * a persistent {@link #REPOSITORY_PATH} is used without disabling it (see {@link #storeData}).
+     */
+    protected static final String DELETE_OLD_DOCS = "delete_old_docs";
+
     /** File name of the advisory lock marker placed next to a persistent {@code repository_path}. */
     protected static final String LOCK_FILE_NAME = ".fess-ds-git.lock";
 
@@ -209,6 +216,18 @@ public class GitDataStore extends AbstractDataStore {
             logger.warn("base_url is blank: indexed document URLs will be empty and delete/rename tracking will be skipped.");
         }
 
+        // A persistent repository_path exists to preserve state across runs, but the fail-fast checks this
+        // plugin adds (unresolvable commit_id, lock contention, etc.) only stop ITS OWN per-file deletes:
+        // Fess's crawling infrastructure still runs deleteOldDocs() after every crawl attempt -- success OR
+        // failure -- unless delete_old_docs=false. So a failed/aborted run would otherwise prune every
+        // previously-indexed document of this DataConfig. Warn so the "required, not just safer" constraint is
+        // visible at runtime, not just in the README.
+        if (StringUtil.isNotBlank(repositoryPath) && !Constants.FALSE.equals(paramMap.getAsString(DELETE_OLD_DOCS))) {
+            logger.warn("repository_path is set but delete_old_docs is not 'false': a failed or aborted crawl will let Fess "
+                    + "prune all previously-indexed documents for this DataConfig. Set delete_old_docs=false to keep the "
+                    + "existing index intact across failed/aborted runs.");
+        }
+
         // getUrlFilter()/logger.info() only depend on paramMap/uri (not on configMap/the lock below), so they
         // are deliberately resolved BEFORE the lock is acquired: getUrlFilter() can throw (e.g.
         // ComponentNotFoundException, or CrawlerSystemException from UrlFilterImpl#init), and if that
@@ -240,6 +259,11 @@ public class GitDataStore extends AbstractDataStore {
         } catch (final Exception e) {
             releaseRepositoryLock(lockHolder);
             throw new DataStoreException("Failed to initialize Git repository " + redactUrl(uri), e);
+        } catch (final Error e) {
+            // An Error (e.g. NoClassDefFoundError) raised after the advisory lock was acquired must not leak
+            // it; release the lock and rethrow the Error unchanged so it still propagates.
+            releaseRepositoryLock(lockHolder);
+            throw e;
         }
         configMap.putAll(lockHolder);
         configMap.put(URI, uri);
@@ -377,7 +401,10 @@ public class GitDataStore extends AbstractDataStore {
         final String paramStr = buildHandlerParameter(dataConfig.getHandlerParameterMap(), toCommitId.name(), sourceRef);
         dataConfig.setHandlerParameter(paramStr);
         if (logger.isDebugEnabled()) {
-            logger.debug("Updating data config by {}.", paramStr);
+            // Do NOT log paramStr: it is the full handlerParameter string and carries the cleartext password
+            // and the raw uri userinfo. Log only non-sensitive identifiers; sourceRef is already redacted
+            // (it is the currentSourceRef built with redactUrl(uri) in storeData).
+            logger.debug("Updating data config {} to commit {} (source_ref={}).", dataConfig.getId(), toCommitId.name(), sourceRef);
         }
         ComponentUtil.getComponent(DataConfigBhv.class).update(dataConfig);
         logger.info("Updated DataConfig: {}", dataConfig.getId());
@@ -584,7 +611,17 @@ public class GitDataStore extends AbstractDataStore {
         }
         configMap.put(REPOSITORY_LOCK_CHANNEL, channel);
         configMap.put(REPOSITORY_LOCK, lock);
-        deleteStaleLockFiles(new File(repositoryPath, ".git"));
+        try {
+            deleteStaleLockFiles(new File(repositoryPath, ".git"));
+        } catch (final RuntimeException | Error e) {
+            // deleteStaleLockFiles already catches the IOException/UncheckedIOException that Files.walk can
+            // throw; any OTHER throwable (e.g. a SecurityException under a SecurityManager) would otherwise
+            // escape before the lock is merged into the caller's finally-guarded configMap, leaking the lock
+            // (and its channel) for the life of the JVM -- exactly the permanent crawl-blocking DoS this
+            // locking exists to prevent. Release on any throw and rethrow.
+            releaseRepositoryLock(configMap);
+            throw e;
+        }
     }
 
     /**
@@ -907,7 +944,13 @@ public class GitDataStore extends AbstractDataStore {
                 crawlerStatsHelper.record(statsKey, StatsAction.PREPARED);
 
                 if (logger.isDebugEnabled()) {
-                    logger.debug("resultMap: {}", resultMap);
+                    // resultMap holds the raw DataConfig under "crawlingConfig"; DataConfig.toString() emits the
+                    // un-redacted handlerParameter (uri userinfo, and a cleartext password after a write-back), so
+                    // log a copy without it -- the other credential-bearing entries (username/password/uri) were
+                    // already removed/redacted above.
+                    final Map<String, Object> logMap = new LinkedHashMap<>(resultMap);
+                    logMap.remove("crawlingConfig");
+                    logger.debug("resultMap: {}", logMap);
                 }
 
                 final String scriptType = getScriptType(paramMap);
