@@ -539,12 +539,9 @@ public class GitDataStoreTest extends UnitDsTestCase {
     @Test
     public void test_buildHandlerParameter_appendsWhenAbsent() {
         final GitDataStore dataStore = new GitDataStore();
-        final Map<String, String> handlerParameterMap = new LinkedHashMap<>();
-        handlerParameterMap.put("uri", "https://example.com/repo.git");
-        handlerParameterMap.put("base_url", "https://example.com/repo/blob/main/");
+        final String handlerParameter = "uri=https://example.com/repo.git\n" + "base_url=https://example.com/repo/blob/main/";
 
-        final String result =
-                dataStore.buildHandlerParameter(handlerParameterMap, "abc123", "https://example.com/repo.git#refs/heads/main");
+        final String result = dataStore.buildHandlerParameter(handlerParameter, "abc123", "https://example.com/repo.git#refs/heads/main");
 
         assertEquals("uri=https://example.com/repo.git\n" + "base_url=https://example.com/repo/blob/main/\n" + "prev_commit_id=abc123\n"
                 + "prev_source_ref=https://example.com/repo.git#refs/heads/main", result);
@@ -554,13 +551,11 @@ public class GitDataStoreTest extends UnitDsTestCase {
     @Test
     public void test_buildHandlerParameter_updatesInPlace() {
         final GitDataStore dataStore = new GitDataStore();
-        final Map<String, String> handlerParameterMap = new LinkedHashMap<>();
-        handlerParameterMap.put("uri", "https://example.com/repo.git");
-        handlerParameterMap.put("prev_commit_id", "OLD_COMMIT");
-        handlerParameterMap.put("prev_source_ref", "https://example.com/repo.git#refs/heads/OLD");
+        final String handlerParameter = "uri=https://example.com/repo.git\n" + "prev_commit_id=OLD_COMMIT\n"
+                + "prev_source_ref=https://example.com/repo.git#refs/heads/OLD";
 
         final String result =
-                dataStore.buildHandlerParameter(handlerParameterMap, "NEW_COMMIT", "https://example.com/repo.git#refs/heads/main");
+                dataStore.buildHandlerParameter(handlerParameter, "NEW_COMMIT", "https://example.com/repo.git#refs/heads/main");
 
         assertEquals("uri=https://example.com/repo.git\n" + "prev_commit_id=NEW_COMMIT\n"
                 + "prev_source_ref=https://example.com/repo.git#refs/heads/main", result);
@@ -573,12 +568,10 @@ public class GitDataStoreTest extends UnitDsTestCase {
     @Test
     public void test_buildHandlerParameter_mixedUpgrade() {
         final GitDataStore dataStore = new GitDataStore();
-        final Map<String, String> handlerParameterMap = new LinkedHashMap<>();
-        handlerParameterMap.put("uri", "https://example.com/repo.git");
-        handlerParameterMap.put("prev_commit_id", "OLD_COMMIT");
+        final String handlerParameter = "uri=https://example.com/repo.git\n" + "prev_commit_id=OLD_COMMIT";
 
         final String result =
-                dataStore.buildHandlerParameter(handlerParameterMap, "NEW_COMMIT", "https://example.com/repo.git#refs/heads/main");
+                dataStore.buildHandlerParameter(handlerParameter, "NEW_COMMIT", "https://example.com/repo.git#refs/heads/main");
 
         assertEquals("uri=https://example.com/repo.git\n" + "prev_commit_id=NEW_COMMIT\n"
                 + "prev_source_ref=https://example.com/repo.git#refs/heads/main", result);
@@ -593,10 +586,9 @@ public class GitDataStoreTest extends UnitDsTestCase {
     public void test_buildHandlerParameter_roundTripsThroughDataConfig() {
         final GitDataStore dataStore = new GitDataStore();
         final String sourceRef = "https://github.com/codelibs/fess.git#refs/heads/main";
-        final Map<String, String> handlerParameterMap = new LinkedHashMap<>();
-        handlerParameterMap.put("uri", "https://github.com/codelibs/fess.git");
+        final String handlerParameter = "uri=https://github.com/codelibs/fess.git";
 
-        final String result = dataStore.buildHandlerParameter(handlerParameterMap, "abc123", sourceRef);
+        final String result = dataStore.buildHandlerParameter(handlerParameter, "abc123", sourceRef);
 
         final DataConfig dataConfig = new DataConfig();
         dataConfig.setHandlerParameter(result);
@@ -605,6 +597,30 @@ public class GitDataStoreTest extends UnitDsTestCase {
         assertEquals(sourceRef, parsed.get("prev_source_ref"));
         // The value read back is exactly what the read side compares against.
         assertTrue(dataStore.isSameSource(parsed.get("prev_source_ref"), sourceRef));
+    }
+
+    // Write-back must edit the RAW handlerParameter string and preserve every non-target line verbatim -- in
+    // particular an encrypted value (password={cipher}...) must keep its stored form and never be rewritten in a
+    // decrypted state. Pre-fix, the write-back rebuilt the string from the already-decrypted
+    // getHandlerParameterMap(), which persisted the secret in cleartext to the config index on every crawl.
+    @Test
+    public void test_buildHandlerParameter_preservesEncryptedValueVerbatim() {
+        final GitDataStore dataStore = new GitDataStore();
+        final String handlerParameter =
+                "uri=https://example.com/repo.git\nusername=alice\npassword={cipher}ABCDEF0123456789\nprev_commit_id=OLD_COMMIT";
+
+        final String result =
+                dataStore.buildHandlerParameter(handlerParameter, "NEW_COMMIT", "https://example.com/repo.git#refs/heads/main");
+
+        // The encrypted secret and the other non-target lines are preserved exactly as stored.
+        assertTrue(result.lines().anyMatch(l -> l.equals("password={cipher}ABCDEF0123456789")));
+        assertTrue(result.lines().anyMatch(l -> l.equals("uri=https://example.com/repo.git")));
+        assertTrue(result.lines().anyMatch(l -> l.equals("username=alice")));
+        assertEquals(1L, result.lines().filter(l -> l.startsWith("password=")).count());
+        // prev_commit_id updated in place, prev_source_ref appended; no duplication.
+        assertEquals(1L, result.lines().filter(l -> l.startsWith("prev_commit_id=")).count());
+        assertTrue(result.lines().anyMatch(l -> l.equals("prev_commit_id=NEW_COMMIT")));
+        assertTrue(result.lines().anyMatch(l -> l.equals("prev_source_ref=https://example.com/repo.git#refs/heads/main")));
     }
 
     // Fix #2 (no regression): an explicitly configured commit_id/branch (non-HEAD) bypasses remote HEAD

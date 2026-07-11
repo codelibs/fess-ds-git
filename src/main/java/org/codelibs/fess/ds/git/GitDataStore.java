@@ -398,12 +398,16 @@ public class GitDataStore extends AbstractDataStore {
      * @param toCommitId The new commit ID.
      */
     protected void updateDataConfig(final DataConfig dataConfig, final String sourceRef, final ObjectId toCommitId) {
-        final String paramStr = buildHandlerParameter(dataConfig.getHandlerParameterMap(), toCommitId.name(), sourceRef);
+        // Pass the RAW handlerParameter string, not getHandlerParameterMap() (which ParameterUtil.parse has
+        // already decrypted): buildHandlerParameter edits only prev_commit_id/prev_source_ref and preserves
+        // every other line verbatim, so encrypted values such as password={cipher}... keep their stored form
+        // instead of being rewritten decrypted on every crawl.
+        final String paramStr = buildHandlerParameter(dataConfig.getHandlerParameter(), toCommitId.name(), sourceRef);
         dataConfig.setHandlerParameter(paramStr);
         if (logger.isDebugEnabled()) {
-            // Do NOT log paramStr: it is the full handlerParameter string and carries the cleartext password
-            // and the raw uri userinfo. Log only non-sensitive identifiers; sourceRef is already redacted
-            // (it is the currentSourceRef built with redactUrl(uri) in storeData).
+            // Do NOT log paramStr: it is the full handlerParameter string and can still carry the raw uri
+            // userinfo (the uri parameter is not an encrypted key). Log only non-sensitive identifiers;
+            // sourceRef is already redacted (the currentSourceRef built with redactUrl(uri) in storeData).
             logger.debug("Updating data config {} to commit {} (source_ref={}).", dataConfig.getId(), toCommitId.name(), sourceRef);
         }
         ComponentUtil.getComponent(DataConfigBhv.class).update(dataConfig);
@@ -411,35 +415,52 @@ public class GitDataStore extends AbstractDataStore {
     }
 
     /**
-     * Builds the {@code handlerParameter} string with {@link #PREV_COMMIT_ID} and {@link #PREV_SOURCE_REF}
-     * applied using an "update in place if the key already exists, otherwise append" strategy so that
-     * existing keys keep their position and are never duplicated.
+     * Rebuilds the {@code handlerParameter} string with {@link #PREV_COMMIT_ID} and {@link #PREV_SOURCE_REF}
+     * applied using an "update in place if the key already exists, otherwise append" strategy so that existing
+     * keys keep their position and are never duplicated.
+     * <p>
+     * The <em>raw</em> stored string is edited line by line rather than being rebuilt from
+     * {@link DataConfig#getHandlerParameterMap()}: that map is already decrypted (by {@code ParameterUtil.parse}),
+     * so rebuilding from it would rewrite secret values such as {@code password={cipher}...} in their decrypted
+     * form. Every line other than the two keys updated here is preserved verbatim, keeping any encrypted values
+     * exactly as stored.
+     * </p>
      *
-     * @param handlerParameterMap The current handler parameter map.
+     * @param handlerParameter The current raw {@code handlerParameter} string (may be {@code null}).
      * @param prevCommitId The commit ID to persist as {@link #PREV_COMMIT_ID}.
      * @param prevSourceRef The source ref to persist as {@link #PREV_SOURCE_REF}.
      * @return The rebuilt {@code handlerParameter} string.
      */
-    protected String buildHandlerParameter(final Map<String, String> handlerParameterMap, final String prevCommitId,
-            final String prevSourceRef) {
-        final Map<String, String> newValues = new LinkedHashMap<>();
-        newValues.put(PREV_COMMIT_ID, prevCommitId);
-        newValues.put(PREV_SOURCE_REF, prevSourceRef);
+    protected String buildHandlerParameter(final String handlerParameter, final String prevCommitId, final String prevSourceRef) {
+        final Map<String, String> pending = new LinkedHashMap<>();
+        pending.put(PREV_COMMIT_ID, prevCommitId);
+        pending.put(PREV_SOURCE_REF, prevSourceRef);
 
         final StringBuilder buf = new StringBuilder();
-        handlerParameterMap.forEach((key, value) -> {
-            if (buf.length() > 0) {
-                buf.append('\n');
-            }
-            buf.append(key).append('=').append(newValues.getOrDefault(key, value));
-        });
-        newValues.forEach((key, value) -> {
-            if (!handlerParameterMap.containsKey(key)) {
+        if (handlerParameter != null) {
+            for (final String line : handlerParameter.split("[\r\n]")) {
+                if (StringUtil.isBlank(line)) {
+                    continue;
+                }
+                final int pos = line.indexOf('=');
+                final String key = (pos >= 0 ? line.substring(0, pos) : line).trim();
                 if (buf.length() > 0) {
                     buf.append('\n');
                 }
-                buf.append(key).append('=').append(value);
+                if (pending.containsKey(key)) {
+                    // Update PREV_COMMIT_ID / PREV_SOURCE_REF in place, keeping their original position.
+                    buf.append(key).append('=').append(pending.remove(key));
+                } else {
+                    // Preserve every other line verbatim so encrypted values (password={cipher}...) survive.
+                    buf.append(line);
+                }
             }
+        }
+        pending.forEach((key, value) -> {
+            if (buf.length() > 0) {
+                buf.append('\n');
+            }
+            buf.append(key).append('=').append(value);
         });
         return buf.toString();
     }
