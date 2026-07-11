@@ -318,13 +318,13 @@ public class GitDataStore extends AbstractDataStore {
                 updateDataConfig(dataConfig, currentSourceRef, toCommitId);
             }
         } catch (final Exception e) {
-            // Give DataStoreException its own redacted top-level message rather than relying on the wrapped
-            // cause's message: JGit's TransportException (thrown by TransportHttp/TransportGitSsh on
-            // auth/network failures) embeds the target URI in its own getMessage() with only the password
-            // stripped (via URIish#setPass(null)) -- the username (e.g. a PAT-style credential used as
-            // username) is left in. The cause itself is still attached (and its message/stack trace may still
-            // contain the unredacted username if logged directly), so this only scrubs the primary message.
-            throw new DataStoreException("Failed to crawl Git repository " + redactUrl(uri), e);
+            // Redact both the DataStoreException's own top-level message AND the wrapped cause chain: JGit's
+            // TransportException (thrown by TransportHttp/TransportGitSsh on auth/network failures) embeds the
+            // target URI in its own getMessage() with only the password stripped (via URIish#setPass(null)) --
+            // the username (e.g. a PAT-style credential used as username) is left in. That cause message is what
+            // log4j2 prints as "Caused by:" and what failure-url reporting persists, so redactCredentialsInChain
+            // scrubs every level of the chain before it is attached.
+            throw new DataStoreException("Failed to crawl Git repository " + redactUrl(uri), redactCredentialsInChain(e));
         } finally {
             try {
                 repository.close();
@@ -481,8 +481,12 @@ public class GitDataStore extends AbstractDataStore {
     /**
      * Scans the given advertised refs for one under {@code refs/heads/} whose object id matches {@code headId}.
      * Used by {@link #resolveDefaultBranch(Repository, FetchResult, String)} to identify a branch name by
-     * content when the advertised {@code HEAD} is not symbolic, mirroring JGit's own
-     * {@code CloneCommand#findBranchToCheckout(FetchResult)}.
+     * content when the advertised {@code HEAD} is not symbolic. This is similar in intent to JGit's own
+     * {@code CloneCommand#findBranchToCheckout(FetchResult)}, but does NOT replicate its tiebreak: when several
+     * advertised branches share {@code HEAD}'s object id, JGit specially prefers {@code refs/heads/master},
+     * whereas this returns the first match in advertised-ref order. That is fine here because advertised-ref
+     * order is deterministic (server-advertised), not a source of run-to-run flapping; it only changes which
+     * branch name is picked on a genuine tie.
      *
      * @param advertisedRefs The refs advertised by the remote.
      * @param headId The object id that the remote's {@code HEAD} points at, or {@code null}.
@@ -518,8 +522,11 @@ public class GitDataStore extends AbstractDataStore {
             throws IOException {
         final ObjectId toCommitId = repository.resolve(resolvedCommitId);
         if (toCommitId == null) {
-            throw new DataStoreException("Could not resolve commit_id '" + commitId
-                    + "'. The branch/tag may not exist, or may have been renamed/deleted upstream.");
+            // Report the ref that actually failed to resolve (resolvedCommitId), not the configured commit_id:
+            // e.g. a configured "HEAD" resolves to "refs/heads/main", and it is that resolved ref which was
+            // unresolvable. The original configured value is still included for context.
+            throw new DataStoreException("Could not resolve commit_id '" + resolvedCommitId + "' (configured commit_id was '" + commitId
+                    + "'). The branch/tag may not exist, or may have been renamed/deleted upstream.");
         }
         return toCommitId;
     }
@@ -736,6 +743,70 @@ public class GitDataStore extends AbstractDataStore {
         return prefix + rest.substring(lastAt + 1);
     }
 
+    /** Matches a scheme + {@code "://"} + userinfo + {@code "@"} occurring anywhere in free text (e.g. inside a
+     *  JGit exception message), so the userinfo can be stripped without disturbing the rest of the message.
+     *  Used by {@link #redactCredentials(String)}. */
+    private static final Pattern EMBEDDED_CREDENTIAL_PATTERN = Pattern.compile("([A-Za-z][A-Za-z0-9+.-]*://)[^\\s/@]+@");
+
+    /** Safety bound on the cause-chain recursion in {@link #redactCredentialsInChain(Throwable)}: real JGit
+     *  chains are only a handful deep, but a cyclic chain (constructible via {@link Throwable#initCause(Throwable)},
+     *  e.g. {@code a -> b -> a}, which rejects only direct self-reference) would otherwise recurse forever. At
+     *  this depth the remaining cause is dropped rather than attached raw, so the result stays safe to
+     *  log/persist even in that never-seen-in-practice case. */
+    private static final int MAX_CAUSE_CHAIN_DEPTH = 20;
+
+    /**
+     * Strips any {@code scheme://userinfo@} occurring anywhere within free-form text (e.g. an exception
+     * message), leaving the scheme and the rest of the text untouched. Unlike {@link #redactUrl(String)}, this
+     * does not require the whole input to be a single URL: JGit exception messages typically embed the target
+     * URI (with the password already stripped but the username left in) inside a larger sentence such as
+     * {@code "https://user@host/repo.git: Connection refused"}.
+     *
+     * @param message The text to scrub.
+     * @return The text with any embedded {@code scheme://userinfo@} stripped, or the input unchanged if it
+     *         contained none (or was blank/{@code null}).
+     */
+    protected String redactCredentials(final String message) {
+        if (StringUtil.isBlank(message)) {
+            return message;
+        }
+        return EMBEDDED_CREDENTIAL_PATTERN.matcher(message).replaceAll("$1");
+    }
+
+    /**
+     * Returns a copy of the given throwable's cause chain with any embedded Git-URL user-info (see
+     * {@link #redactCredentials(String)}) stripped from every message in the chain, so it is safe to log or
+     * persist to a failure-url record. Preserves each level's original stack trace and embeds the original
+     * class name in the replacement message (so logs still show what type of error it was). A chain that needed
+     * no redaction anywhere is returned as the same instance (no pointless wrapping).
+     *
+     * @param throwable The throwable (possibly with a cause chain) to sanitize.
+     * @return A sanitized copy, or the original instance if nothing needed redaction, or {@code null} if the
+     *         input was {@code null}.
+     */
+    protected Throwable redactCredentialsInChain(final Throwable throwable) {
+        return redactCredentialsInChain(throwable, 0);
+    }
+
+    private Throwable redactCredentialsInChain(final Throwable throwable, final int depth) {
+        if (throwable == null) {
+            return null;
+        }
+        final String message = throwable.getMessage();
+        final String redactedMessage = redactCredentials(message);
+        final Throwable originalCause = throwable.getCause();
+        // Stop recursing at MAX_CAUSE_CHAIN_DEPTH and drop the remaining cause: a cyclic chain would otherwise
+        // recurse forever, and dropping the deeper cause keeps the result safe to log/persist even then.
+        final Throwable redactedCause = depth >= MAX_CAUSE_CHAIN_DEPTH ? null : redactCredentialsInChain(originalCause, depth + 1);
+        if (Objects.equals(message, redactedMessage) && redactedCause == originalCause) {
+            return throwable;
+        }
+        final RuntimeException sanitized = new RuntimeException(
+                throwable.getClass().getName() + (redactedMessage != null ? ": " + redactedMessage : StringUtil.EMPTY), redactedCause);
+        sanitized.setStackTrace(throwable.getStackTrace());
+        return sanitized;
+    }
+
     /**
      * Returns the file name from the given path.
      *
@@ -868,7 +939,11 @@ public class GitDataStore extends AbstractDataStore {
                 }
             }
         } catch (final CrawlingAccessException e) {
-            logger.warn("Crawling Access Exception at : {}", dataMap, e);
+            // The exception message may embed a Git URL with credentials (see redactCredentials); scrub the
+            // chain before it is logged or persisted. The original objects are still used below for the
+            // instanceof/errorName checks, which only read class names (never sensitive).
+            final Throwable redactedException = redactCredentialsInChain(e);
+            logger.warn("Crawling Access Exception at : {}", dataMap, redactedException);
 
             Throwable target = e;
             if (target instanceof MultipleCrawlingAccessException) {
@@ -896,13 +971,15 @@ public class GitDataStore extends AbstractDataStore {
                 url = redactUrl(uri) + ":" + path;
             }
             final FailureUrlService failureUrlService = ComponentUtil.getComponent(FailureUrlService.class);
-            failureUrlService.store(dataConfig, errorName, url, target);
+            failureUrlService.store(dataConfig, errorName, url, redactCredentialsInChain(target));
             crawlerStatsHelper.record(statsKey, StatsAction.ACCESS_EXCEPTION);
         } catch (final Throwable t) {
-            logger.warn("Crawling Access Exception at : {}", dataMap, t);
+            // Scrub any credential-bearing Git URL out of the message chain before logging/persisting it.
+            final Throwable redactedThrowable = redactCredentialsInChain(t);
+            logger.warn("Crawling Access Exception at : {}", dataMap, redactedThrowable);
             final String url = redactUrl(uri) + ":" + path;
             final FailureUrlService failureUrlService = ComponentUtil.getComponent(FailureUrlService.class);
-            failureUrlService.store(dataConfig, t.getClass().getCanonicalName(), url, t);
+            failureUrlService.store(dataConfig, t.getClass().getCanonicalName(), url, redactedThrowable);
 
             final long readInterval = (Long) configMap.get(READ_INTERVAL);
             if (readInterval > 0) {
@@ -1022,6 +1099,20 @@ public class GitDataStore extends AbstractDataStore {
                 // this method runs, so repoFile.exists() alone would no longer reliably indicate whether this
                 // is a brand-new repository that still needs repository.create().
                 final File gitDir = new File(repositoryPath, ".git");
+                // A run killed mid-initialization can leave .git as a partial skeleton. JGit's
+                // repository.create() writes .git/config LAST (its final cfg.save()) and refuses to re-run
+                // once config exists, so config's presence reliably marks a completed initialization and its
+                // absence marks an interrupted one. Because create() also runs BEFORE any fetch, a .git without
+                // config can never contain fetched data, so discarding it loses nothing. Delete the partial
+                // directory (only .git, never repositoryPath, whose advisory lock marker must survive) so the
+                // repository is re-created below -- a plain re-create() alone cannot repair it, as refs.create()
+                // throws on the already-existing refs/. A completed repo keeps its config and is left untouched.
+                if (gitDir.exists() && !new File(gitDir, org.eclipse.jgit.lib.Constants.CONFIG).exists()) {
+                    logger.warn("Removing an incomplete Git repository left by a previously interrupted crawl: {}",
+                            gitDir.getAbsolutePath());
+                    org.eclipse.jgit.util.FileUtils.delete(gitDir,
+                            org.eclipse.jgit.util.FileUtils.RECURSIVE | org.eclipse.jgit.util.FileUtils.SKIP_MISSING);
+                }
                 final boolean gitDirExists = gitDir.exists();
                 final Repository repository = FileRepositoryBuilder.create(gitDir);
                 if (!gitDirExists) {

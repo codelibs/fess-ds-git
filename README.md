@@ -31,6 +31,10 @@ prev_commit_id=
 # prunes files removed/renamed upstream. Setting it to "false" disables that cleanup, which is safer while
 # testing a new configuration (or, e.g., during a fail-fast error triggered by the new fetch/checkout
 # error paths in this plugin) since a failed/aborted run will not wipe out the previously-indexed documents.
+# Note: this plugin's fail-fast checks only stop ITS OWN per-file deletes; Fess's crawling infrastructure
+# runs deleteOldDocs() unconditionally after every crawl attempt (success or failure) unless this is
+# "false", so "false" is required, not just safer, for a failed/aborted run to leave previously-indexed
+# documents intact.
 delete_old_docs=false
 ```
 

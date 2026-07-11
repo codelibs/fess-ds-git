@@ -236,7 +236,10 @@ public class GitDataStoreTest extends UnitDsTestCase {
                 dataStore.resolveToCommitId(repo, "ghost-branch", "refs/heads/ghost-branch");
                 fail("Expected DataStoreException");
             } catch (final DataStoreException e) {
-                assertTrue(e.getMessage().contains("Could not resolve commit_id 'ghost-branch'"));
+                // The message reports the ref that actually failed to resolve (the resolvedCommitId), and
+                // includes the originally configured commit_id for context.
+                assertTrue(e.getMessage().contains("Could not resolve commit_id 'refs/heads/ghost-branch'"));
+                assertTrue(e.getMessage().contains("configured commit_id was 'ghost-branch'"));
             }
         }
     }
@@ -350,6 +353,52 @@ public class GitDataStoreTest extends UnitDsTestCase {
             unreadableDir.setReadable(true);
             unreadableDir.setExecutable(true);
         }
+    }
+
+    // Fix #5: a first run killed mid-initialization can leave repository_path/.git as a partial skeleton.
+    // JGit's repository.create() writes .git/config LAST (cfg.save()) and refuses to re-run once config
+    // exists, so an interrupted create() leaves a .git that JGit cannot open (no object database / HEAD /
+    // config). The pre-existing check only skipped create() when .git already existed, so every subsequent
+    // run reused the unopenable partial repo and failed identically forever. The partial .git must be
+    // discarded and re-created so the next run succeeds -- the same "repeated-crawl failure" class the
+    // stale-.lock-file fix addresses, but for the narrower interrupted-initial-creation window.
+    @Test
+    public void test_storeData_recreatesIncompleteRepository() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("a.txt", "a");
+        final File remote = createLocalRepo("main", files);
+
+        final File persistent = Files.createTempDirectory("fess-ds-git-persist-").toFile();
+        tempDirs.add(persistent);
+        // Simulate a create() killed mid-initialization: .git exists with only refs/ (no HEAD, no object
+        // database, no config). This is the hardest case for a heal -- a plain re-create() cannot repair it
+        // because refs.create() throws (mkdir on the already-existing refs/), so the partial .git must be
+        // deleted before re-creating.
+        final File refsDir = new File(persistent, ".git/refs");
+        assertTrue(refsDir.mkdirs());
+        assertFalse(new File(persistent, ".git/config").exists());
+
+        final DataStoreParams params = new DataStoreParams();
+        params.put("uri", remote.getAbsolutePath());
+        params.put("repository_path", persistent.getAbsolutePath());
+
+        // Run 1: the partial repo must be healed and the crawl must complete (pre-fix, this run throws).
+        final List<String> firstRun = new ArrayList<>();
+        newCollectingDataStore(firstRun).storeData(null, null, params, null, null);
+        assertTrue(firstRun.contains("a.txt"));
+        assertTrue(new File(persistent, ".git/config").exists());
+
+        // A sentinel written inside the now-valid .git proves run 2 does NOT re-delete it: because the
+        // remote is always reachable here, a wrongful re-delete would still re-fetch and collect a.txt, so
+        // "second run succeeds" alone cannot distinguish "left untouched" from "deleted and rebuilt".
+        final File sentinel = new File(persistent, ".git/fess-heal-sentinel");
+        assertTrue(sentinel.createNewFile());
+
+        // Run 2: the now-valid repository (config present) must be left untouched and reused, not re-deleted.
+        final List<String> secondRun = new ArrayList<>();
+        newCollectingDataStore(secondRun).storeData(null, null, params, null, null);
+        assertTrue(secondRun.contains("a.txt"));
+        assertTrue(sentinel.exists());
     }
 
     // Fix #4: an unchanged uri/branch (prev_source_ref matches) keeps using prev_commit_id for an incremental diff.
@@ -627,6 +676,14 @@ public class GitDataStoreTest extends UnitDsTestCase {
             final String msg = e.getMessage();
             assertFalse(msg != null && msg.contains("leakyuser"));
             assertFalse(msg != null && msg.contains("leakysecret"));
+            // The wrapped cause is what log4j2 prints as "Caused by:" and what failureUrlService persists, so
+            // its message must be scrubbed too. JGit's TransportException embeds the username (only the password
+            // is stripped) in its own getMessage(), so a raw cause here would still leak "leakyuser".
+            final Throwable cause = e.getCause();
+            assertNotNull(cause);
+            final String causeMsg = cause.getMessage();
+            assertFalse(causeMsg != null && causeMsg.contains("leakyuser"));
+            assertFalse(causeMsg != null && causeMsg.contains("leakysecret"));
         }
     }
 
@@ -851,6 +908,68 @@ public class GitDataStoreTest extends UnitDsTestCase {
         // no scheme:// prefix at all, so it must NOT be routed through maskConservatively() and must come
         // back completely unchanged -- there is no credential here to strip.
         assertEquals("/home/user@company/repos/x.git", dataStore.redactUrl("/home/user@company/repos/x.git"));
+    }
+
+    // Fix #10 (helper): redactCredentials scrubs a scheme://userinfo@ embedded anywhere in free-form text (e.g.
+    // a JGit exception message), leaving the scheme and the rest of the text intact; text with no embedded URL
+    // is returned unchanged.
+    @Test
+    public void test_redactCredentials() {
+        final GitDataStore dataStore = new GitDataStore();
+
+        // Username-only userinfo embedded mid-message (JGit strips the password but leaves the username).
+        assertEquals("https://127.0.0.1:1/nonexistent.git: Connection refused",
+                dataStore.redactCredentials("https://leakyuser@127.0.0.1:1/nonexistent.git: Connection refused"));
+
+        // Userinfo embedded with text BEFORE the URL: only the userinfo is stripped, surrounding text is kept.
+        assertEquals("failed to fetch https://host/repo.git for crawl",
+                dataStore.redactCredentials("failed to fetch https://tokenuser@host/repo.git for crawl"));
+
+        // Full user:pass userinfo embedded mid-message.
+        assertEquals("https://host/repo.git: auth failed", dataStore.redactCredentials("https://user:pass@host/repo.git: auth failed"));
+
+        // No embedded URL at all: returned completely unchanged.
+        assertEquals("plain error message with no url", dataStore.redactCredentials("plain error message with no url"));
+
+        // Blank/null returned unchanged without throwing.
+        assertEquals("", dataStore.redactCredentials(""));
+        assertNull(dataStore.redactCredentials(null));
+    }
+
+    // Fix #10 (helper): redactCredentialsInChain scrubs credentials from EVERY level of a cause chain (this is
+    // what log4j2 prints as "Caused by:" and what failureUrlService persists), returns the SAME instance when
+    // nothing needs redaction, and passes null through.
+    @Test
+    public void test_redactCredentialsInChain() {
+        final GitDataStore dataStore = new GitDataStore();
+
+        // Both levels carry an embedded credential; both must be scrubbed.
+        final Throwable leaky = new RuntimeException("outer https://leakyuser:leakysecret@host/repo.git: boom",
+                new IllegalStateException("inner https://leakyuser@host2/other.git: nope"));
+        final Throwable sanitized = dataStore.redactCredentialsInChain(leaky);
+        assertFalse(sanitized.getMessage().contains("leakyuser"));
+        assertFalse(sanitized.getMessage().contains("leakysecret"));
+        assertNotNull(sanitized.getCause());
+        assertFalse(sanitized.getCause().getMessage().contains("leakyuser"));
+        assertFalse(sanitized.getCause().getMessage().contains("leakysecret"));
+        // The replacement message embeds the original class name so logs still show the error type.
+        assertTrue(sanitized.getMessage().contains("java.lang.RuntimeException"));
+        // The original chain is left untouched (a sanitized copy is returned, not an in-place mutation).
+        assertTrue(leaky.getMessage().contains("leakyuser"));
+
+        // A leak only in the deeper cause must still be scrubbed, and the wrapper is rebuilt (different instance).
+        final Throwable cleanOuterLeakyInner =
+                new RuntimeException("clean outer message", new IllegalStateException("inner https://leakyuser@host/r.git: x"));
+        final Throwable sanitized2 = dataStore.redactCredentialsInChain(cleanOuterLeakyInner);
+        assertTrue(sanitized2 != cleanOuterLeakyInner);
+        assertFalse(sanitized2.getCause().getMessage().contains("leakyuser"));
+
+        // A chain with no embedded credentials anywhere is returned as the SAME instance (no pointless wrapping).
+        final Throwable clean = new RuntimeException("no url here", new IllegalStateException("still nothing"));
+        assertSame(clean, dataStore.redactCredentialsInChain(clean));
+
+        // Null passes through.
+        assertNull(dataStore.redactCredentialsInChain(null));
     }
 
     // Fix #6 (residual): the "uri" placed into resultMap is DEBUG-logged and available to the script
