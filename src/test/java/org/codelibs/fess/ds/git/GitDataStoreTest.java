@@ -58,6 +58,7 @@ import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.diff.DiffEntry;
 import org.eclipse.jgit.diff.DiffFormatter;
 import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
@@ -123,28 +124,24 @@ public class GitDataStoreTest extends UnitDsTestCase {
                 .call();
     }
 
+    // Hermetic fixture (no network/GitHub dependency): a local scratch repository standing in for the
+    // previous live "https://github.com/codelibs/fess-ds-git.git" clone. Since @Test annotations are fixed
+    // (they now actually run in CI), this test must not depend on network/GitHub availability.
     @Test
-    public void test_storeData() {
+    public void test_storeData() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("pom.xml", "<project/>");
+        files.put("README.md", "hello world");
+        files.put("src/main/java/App.java", "public class App {}");
+        final File remote = createLocalRepo("main", files);
+
         DataStoreParams params = new DataStoreParams();
-        params.put("uri", "https://github.com/codelibs/fess-ds-git.git");
+        params.put("uri", remote.getAbsolutePath());
         params.put("base_url", "https://github.com/codelibs/fess-ds-git/blob/master/");
         params.put("extractors",
                 "text/.*:textExtractor,application/xml:textExtractor,application/javascript:textExtractor,application/json:textExtractor,application/x-sh:textExtractor,application/x-bat:textExtractor,audio/.*:filenameExtractor,chemical/.*:filenameExtractor,image/.*:filenameExtractor,model/.*:filenameExtractor,video/.*:filenameExtractor,");
         final List<String> urlList = new ArrayList<>();
-        GitDataStore dataStore = new GitDataStore() {
-            @Override
-            protected UrlFilter getUrlFilter(final DataStoreParams paramMap) {
-                return new MockUrlFilter();
-            }
-
-            @Override
-            protected void processFile(final DataConfig dataConfig, final IndexUpdateCallback callback, final DataStoreParams paramMap,
-                    final Map<String, String> scriptMap, final Map<String, Object> defaultDataMap, final Map<String, Object> configMap) {
-                final DiffEntry diffEntry = (DiffEntry) configMap.get(DIFF_ENTRY);
-                final String path = diffEntry.getNewPath();
-                urlList.add(path);
-            }
-        };
+        GitDataStore dataStore = newCollectingDataStore(urlList);
         dataStore.storeData(null, null, params, null, null);
 
         assertTrue(urlList.stream().anyMatch(s -> s.endsWith("pom.xml")));
@@ -296,6 +293,62 @@ public class GitDataStoreTest extends UnitDsTestCase {
                 final String msg = e.getCause() != null ? e.getCause().getMessage() : e.getMessage();
                 assertTrue(msg != null && msg.contains("Another crawl appears to be using repository_path"));
             }
+        }
+    }
+
+    // Bug fix (post-review): deleteStaleLockFiles()'s Files.walk() can throw an UNCHECKED
+    // java.io.UncheckedIOException mid-traversal (e.g. AccessDeniedException on a subdirectory another tool
+    // is concurrently touching -- exactly the scenario this PR's own README caveat warns about), which is NOT
+    // caught by the existing `catch (final IOException e)` clause. Since lockRepositoryPath() ->
+    // deleteStaleLockFiles() is called from storeData() with no surrounding try/catch, an uncaught
+    // UncheckedIOException here would propagate straight out of storeData(), skipping the try/finally that
+    // calls releaseRepositoryLock() -- leaking the just-acquired advisory FileLock for the life of the JVM
+    // and blocking every future crawl of this repository_path.
+    @Test
+    public void test_storeData_staleLockScanIOErrorDoesNotLeakLock() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("a.txt", "a");
+        final File remote = createLocalRepo("main", files);
+
+        final File persistent = Files.createTempDirectory("fess-ds-git-persist-").toFile();
+        tempDirs.add(persistent);
+        try (Repository repo = FileRepositoryBuilder.create(new File(persistent, ".git"))) {
+            repo.create();
+        }
+        // An unreadable/unsearchable subdirectory under .git makes Files.walk() throw UncheckedIOException
+        // mid-traversal (AccessDeniedException while trying to list it), rather than at the initial walk()
+        // call -- reproducing the real-world "another tool touching .git concurrently" failure mode.
+        final File unreadableDir = new File(persistent, ".git/unreadable-by-another-tool");
+        assertTrue(unreadableDir.mkdirs());
+        unreadableDir.setExecutable(false);
+        unreadableDir.setReadable(false);
+        // On a platform/user (e.g. root) where directory permission bits are not enforced, this
+        // reproduction cannot fire; skip rather than risk a flaky/misleading pass or failure.
+        org.junit.jupiter.api.Assumptions.assumeFalse(unreadableDir.canRead(),
+                "Directory read permission is not enforced for the current user; skipping.");
+
+        try {
+            final DataStoreParams params = new DataStoreParams();
+            params.put("uri", remote.getAbsolutePath());
+            params.put("repository_path", persistent.getAbsolutePath());
+            final List<String> urlList = new ArrayList<>();
+            newCollectingDataStore(urlList).storeData(null, null, params, null, null);
+
+            // The scan failure must be swallowed (logged) and the crawl must complete normally.
+            assertTrue(urlList.contains("a.txt"));
+
+            // The advisory lock must have been released -- a fresh, independent lock attempt on the same
+            // marker file (from this same JVM) must succeed. Pre-fix, the lock leaks and this would throw
+            // OverlappingFileLockException.
+            final File marker = new File(persistent, ".fess-ds-git.lock");
+            try (FileChannel channel = FileChannel.open(marker.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                    FileLock lock = channel.tryLock()) {
+                assertNotNull(lock);
+            }
+        } finally {
+            // Restore permissions so tearDown's deleteDirectory() can actually remove the temp tree.
+            unreadableDir.setReadable(true);
+            unreadableDir.setExecutable(true);
         }
     }
 
@@ -471,6 +524,206 @@ public class GitDataStoreTest extends UnitDsTestCase {
                 dataStore.resolveDefaultBranch(null, null, "0123456789abcdef0123456789abcdef01234567"));
     }
 
+    // Fix #11: for a brand-new (not-yet-existing) repository_path, the advisory lock must be acquired BEFORE
+    // any repository creation happens (repository.create() writes HEAD/config/description/refs/objects
+    // non-atomically). Before this fix, createConfigMap() (called before lockRepositoryPath()) would already
+    // have fully initialized the on-disk repo by the time the lock was even attempted -- meaning the very
+    // first concurrent use of a brand-new repository_path by two overlapping crawls was NOT protected by the
+    // lock at all. This is verified deterministically (no real thread race, which would be flaky) by
+    // instrumenting lockRepositoryPath() to record whether .git already exists at the moment it is called.
+    @Test
+    public void test_storeData_locksBeforeRepositoryCreate() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("a.txt", "a");
+        final File remote = createLocalRepo("main", files);
+
+        final File persistentParent = Files.createTempDirectory("fess-ds-git-persist-").toFile();
+        tempDirs.add(persistentParent);
+        final File persistent = new File(persistentParent, "brand-new-repo"); // does not exist at all yet
+
+        final DataStoreParams params = new DataStoreParams();
+        params.put("uri", remote.getAbsolutePath());
+        params.put("repository_path", persistent.getAbsolutePath());
+
+        final List<String> urlList = new ArrayList<>();
+        final AtomicReference<Boolean> gitDirExistedAtLockTime = new AtomicReference<>();
+        final GitDataStore dataStore = new GitDataStore() {
+            @Override
+            protected UrlFilter getUrlFilter(final DataStoreParams paramMap) {
+                return new MockUrlFilter();
+            }
+
+            @Override
+            protected void processFile(final DataConfig dataConfig, final IndexUpdateCallback callback, final DataStoreParams paramMap,
+                    final Map<String, String> scriptMap, final Map<String, Object> defaultDataMap, final Map<String, Object> configMap) {
+                urlList.add(((DiffEntry) configMap.get(DIFF_ENTRY)).getNewPath());
+            }
+
+            @Override
+            protected void lockRepositoryPath(final File repositoryPath, final Map<String, Object> configMap) {
+                gitDirExistedAtLockTime.set(new File(repositoryPath, ".git").exists());
+                super.lockRepositoryPath(repositoryPath, configMap);
+            }
+        };
+        dataStore.storeData(null, null, params, null, null);
+
+        assertNotNull(gitDirExistedAtLockTime.get());
+        assertFalse(gitDirExistedAtLockTime.get());
+        assertTrue(urlList.contains("a.txt"));
+    }
+
+    // Fix #11 (regression guard): getUrlFilter() is resolved BEFORE the advisory lock is acquired specifically
+    // so that a getUrlFilter() failure (e.g. ComponentNotFoundException, or CrawlerSystemException from
+    // UrlFilterImpl#init) can never leave the lock held. A lock leaked here would never be released (nothing
+    // in storeData's try/finally runs, since the failure happens before either exists), blocking every future
+    // crawl of this repository_path until JVM restart -- exactly the repeated-crawl-failure class this PR
+    // exists to eliminate. Proven by making getUrlFilter() throw and then confirming the marker lock is still
+    // independently acquirable immediately afterward.
+    @Test
+    public void test_storeData_getUrlFilterFailureDoesNotLeakLock() throws Exception {
+        final File persistent = Files.createTempDirectory("fess-ds-git-persist-").toFile();
+        tempDirs.add(persistent);
+
+        final DataStoreParams params = new DataStoreParams();
+        params.put("uri", "https://example.invalid/repo.git"); // never reached
+        params.put("repository_path", persistent.getAbsolutePath());
+
+        final GitDataStore dataStore = new GitDataStore() {
+            @Override
+            protected UrlFilter getUrlFilter(final DataStoreParams paramMap) {
+                throw new RuntimeException("simulated getUrlFilter failure");
+            }
+        };
+
+        try {
+            dataStore.storeData(null, null, params, null, null);
+            fail("Expected RuntimeException");
+        } catch (final RuntimeException e) {
+            assertEquals("simulated getUrlFilter failure", e.getMessage());
+        }
+
+        final File marker = new File(persistent, ".fess-ds-git.lock");
+        try (FileChannel channel = FileChannel.open(marker.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                FileLock lock = channel.tryLock()) {
+            // Non-null proves the lock was never acquired (and thus never leaked) by the failed storeData call.
+            assertNotNull(lock);
+        }
+    }
+
+    // Fix #10: JGit's own TransportException embeds the target URI in its message with only the PASSWORD
+    // stripped (via URIish#setPass(null)) -- the USERNAME (e.g. a PAT-style credential used as username) is
+    // left in. storeData's top-level catch must not let that raw message become the DataStoreException's own
+    // message, since it feeds logs/error reporting.
+    @Test
+    public void test_storeData_fetchFailureMessageDoesNotLeakCredential() {
+        final DataStoreParams params = new DataStoreParams();
+        // Port 1 is a reserved/unassigned port that refuses connections immediately (no timeout wait).
+        params.put("uri", "https://leakyuser:leakysecret@127.0.0.1:1/nonexistent.git");
+        final List<String> urlList = new ArrayList<>();
+        try {
+            newCollectingDataStore(urlList).storeData(null, null, params, null, null);
+            fail("Expected DataStoreException");
+        } catch (final DataStoreException e) {
+            final String msg = e.getMessage();
+            assertFalse(msg != null && msg.contains("leakyuser"));
+            assertFalse(msg != null && msg.contains("leakysecret"));
+        }
+    }
+
+    // Fix #9: when the remote's advertised HEAD is NOT symbolic (some transports/servers don't advertise the
+    // git symref capability for HEAD), JGit's own CloneCommand#findBranchToCheckout still identifies a proper
+    // branch name by scanning refs/heads/* for one whose objectId matches HEAD's objectId, falling back to a
+    // bare SHA only if nothing matches. resolveDefaultBranch must replicate that scan instead of immediately
+    // returning the raw SHA -- a raw SHA in prev_source_ref would make isSameSource() flip-flop across runs
+    // with no actual branch/uri change (since the SHA moves as the branch advances).
+    @Test
+    public void test_findAdvertisedBranchByObjectId_matchesRefsHeads() throws Exception {
+        final GitDataStore dataStore = new GitDataStore();
+        final ObjectId targetId = ObjectId.fromString("0123456789abcdef0123456789abcdef01234567");
+        final ObjectId otherId = ObjectId.fromString("fedcba9876543210fedcba9876543210fedcba98");
+        final List<Ref> advertisedRefs = new ArrayList<>();
+        advertisedRefs.add(new FakeRef("refs/heads/develop", otherId));
+        advertisedRefs.add(new FakeRef("refs/heads/main", targetId));
+        advertisedRefs.add(new FakeRef("refs/tags/v1.0", targetId)); // a tag must NOT be treated as a branch
+
+        final String result = dataStore.findAdvertisedBranchByObjectId(advertisedRefs, targetId);
+
+        assertEquals("refs/heads/main", result);
+    }
+
+    @Test
+    public void test_findAdvertisedBranchByObjectId_noMatchReturnsNull() throws Exception {
+        final GitDataStore dataStore = new GitDataStore();
+        final ObjectId targetId = ObjectId.fromString("0123456789abcdef0123456789abcdef01234567");
+        final ObjectId otherId = ObjectId.fromString("fedcba9876543210fedcba9876543210fedcba98");
+        final List<Ref> advertisedRefs = new ArrayList<>();
+        advertisedRefs.add(new FakeRef("refs/heads/develop", otherId));
+
+        // Nothing under refs/heads/ matches the (detached/anonymous) target -- there is genuinely no branch
+        // name to report, so the caller must fall back to the raw SHA.
+        assertNull(dataStore.findAdvertisedBranchByObjectId(advertisedRefs, targetId));
+    }
+
+    @Test
+    public void test_findAdvertisedBranchByObjectId_nullHeadIdReturnsNull() throws Exception {
+        final GitDataStore dataStore = new GitDataStore();
+        final List<Ref> advertisedRefs = new ArrayList<>();
+        advertisedRefs.add(new FakeRef("refs/heads/main", ObjectId.fromString("0123456789abcdef0123456789abcdef01234567")));
+
+        assertNull(dataStore.findAdvertisedBranchByObjectId(advertisedRefs, null));
+    }
+
+    /** Minimal {@link Ref} test double: only getName()/getObjectId() are exercised by the code under test. */
+    private static final class FakeRef implements Ref {
+        private final String name;
+        private final ObjectId objectId;
+
+        FakeRef(final String name, final ObjectId objectId) {
+            this.name = name;
+            this.objectId = objectId;
+        }
+
+        @Override
+        public String getName() {
+            return name;
+        }
+
+        @Override
+        public boolean isSymbolic() {
+            return false;
+        }
+
+        @Override
+        public Ref getLeaf() {
+            return this;
+        }
+
+        @Override
+        public Ref getTarget() {
+            return this;
+        }
+
+        @Override
+        public ObjectId getObjectId() {
+            return objectId;
+        }
+
+        @Override
+        public ObjectId getPeeledObjectId() {
+            return null;
+        }
+
+        @Override
+        public boolean isPeeled() {
+            return false;
+        }
+
+        @Override
+        public Storage getStorage() {
+            return Storage.LOOSE;
+        }
+    }
+
     // Fix #8: a blank base_url must emit a WARN so operators know indexed URLs will be empty and delete/rename
     // tracking is skipped.
     @Test
@@ -541,15 +794,63 @@ public class GitDataStoreTest extends UnitDsTestCase {
         }
     }
 
-    // Fix #6: credentials embedded in a Git URI must be redacted before logging.
+    // Fix #6: credentials embedded in a Git URI must be redacted before logging. redactUrl() must be
+    // fail-CLOSED: java.net.URI is a strict RFC-3986 parser that throws on very common real-world Git
+    // credential syntax (scp-style user@host:path, unescaped '@'/'/' in passwords), and the old
+    // implementation returned the RAW url unchanged whenever that parser choked -- i.e. it failed OPEN.
     @Test
     public void test_redactUrl() {
         final GitDataStore dataStore = new GitDataStore();
+        // Normal case: URI authority with user:password -- must already work (regression check).
         assertEquals("https://github.com/codelibs/fess.git", dataStore.redactUrl("https://user:token@github.com/codelibs/fess.git"));
+
+        // scp-style remotes DO carry a credential-bearing user, and it must not survive redaction, even
+        // though java.net.URI cannot parse this syntax at all.
+        final String scpRedacted = dataStore.redactUrl("tokenuser@gitlab.example.com:group/project.git");
+        assertFalse(scpRedacted.contains("tokenuser"));
+        assertEquals("gitlab.example.com:group/project.git", scpRedacted);
+
+        // A password containing an unescaped '@' is valid in real-world Git credentials but is illegal
+        // per strict RFC-3986 userinfo syntax.
+        final String atInPassword = dataStore.redactUrl("https://user:p@ssw0rd@host/repo.git");
+        assertFalse(atInPassword.contains("p@ssw0rd"));
+        assertFalse(atInPassword.contains("ssw0rd"));
+
+        // A password containing an unescaped '/' likewise breaks strict URI parsing.
+        final String slashInPassword = dataStore.redactUrl("https://user:p/ssw0rd@host/repo.git");
+        assertFalse(slashInPassword.contains("p/ssw0rd"));
+        assertFalse(slashInPassword.contains("ssw0rd"));
+
+        // No credentials at all: must be returned unchanged (no regression).
         assertEquals("https://github.com/codelibs/fess.git", dataStore.redactUrl("https://github.com/codelibs/fess.git"));
-        // scp-style remotes have no URI authority component, so there is nothing to redact and they are returned as-is.
-        assertEquals("git@github.com:codelibs/fess.git", dataStore.redactUrl("git@github.com:codelibs/fess.git"));
+
+        // A conventional non-secret scp-style user (e.g. "git") is still stripped -- redactUrl cannot tell
+        // it apart from a credential-bearing user, and stripping it is harmless for a log/index value.
+        assertEquals("github.com:codelibs/fess.git", dataStore.redactUrl("git@github.com:codelibs/fess.git"));
+
+        // Blank/null input must be returned unchanged without throwing.
         assertEquals("", dataStore.redactUrl(""));
+        assertNull(dataStore.redactUrl(null));
+
+        // Bug fix (post-review): an uppercase/mixed-case scheme (e.g. "HTTPS://") makes JGit's URIish fail
+        // its normal FULL_URI parse (its internal SCHEME_P regex is lowercase-only) and silently fall through
+        // to the lenient LOCAL_FILE catch-all, which treats the entire input as an opaque local path --
+        // scheme/host/user/pass all come back null. Neither existing branch fires on that, so without a fix
+        // the raw, credential-bearing url would be returned completely unredacted.
+        final String upperScheme = dataStore.redactUrl("HTTPS://user:pass@Host/Repo.Git");
+        assertFalse(upperScheme.contains("pass"));
+
+        final String mixedScheme = dataStore.redactUrl("Https://user:token@host/repo.git");
+        assertFalse(mixedScheme.contains("token"));
+
+        // No credentials to strip: an uppercase-scheme url with no user-info must still come back essentially
+        // unchanged (not corrupted/emptied) even though it is routed through maskConservatively().
+        assertEquals("HTTPS://github.com/codelibs/fess.git", dataStore.redactUrl("HTTPS://github.com/codelibs/fess.git"));
+
+        // A genuine schemeless local filesystem path containing a literal '@' (e.g. in a directory name) has
+        // no scheme:// prefix at all, so it must NOT be routed through maskConservatively() and must come
+        // back completely unchanged -- there is no credential here to strip.
+        assertEquals("/home/user@company/repos/x.git", dataStore.redactUrl("/home/user@company/repos/x.git"));
     }
 
     // Fix #6 (residual): the "uri" placed into resultMap is DEBUG-logged and available to the script
@@ -848,75 +1149,115 @@ public class GitDataStoreTest extends UnitDsTestCase {
         }
     }
 
+    // These three tests exercise the REAL GitDataStore#getUrlFilter (no override): it looks up a UrlFilter
+    // component via ComponentUtil, so a RecordingUrlFilter test double is registered as that component
+    // (the same "fake the collaborator, exercise the real method" pattern runProcessFileCapturingResultMap
+    // uses for SystemHelper/CrawlerStatsHelper). This replaces the previous versions, which claimed to "call
+    // parent implementation to test it" but actually overrode getUrlFilter with a hand-rolled reimplementation
+    // that never called super, so the real method was never exercised and only assertNotNull(filter) was
+    // checked.
     @Test
     public void test_getUrlFilter_withIncludePattern() {
-        GitDataStore dataStore = new GitDataStore() {
-            @Override
-            protected UrlFilter getUrlFilter(final DataStoreParams paramMap) {
-                // Call parent implementation to test it
-                UrlFilter filter = new MockUrlFilter();
-                final String include = paramMap.getAsString("include_pattern");
-                if (include != null && !include.isEmpty()) {
-                    filter.addInclude(include);
-                }
-                return filter;
-            }
-        };
+        final RecordingUrlFilter fakeFilter = new RecordingUrlFilter();
+        ComponentUtil.register(fakeFilter, UrlFilter.class.getCanonicalName());
+        final GitDataStore dataStore = new GitDataStore();
 
-        DataStoreParams params = new DataStoreParams();
+        final DataStoreParams params = new DataStoreParams();
         params.put("include_pattern", ".*\\.java");
 
-        UrlFilter filter = dataStore.getUrlFilter(params);
-        assertNotNull(filter);
+        final UrlFilter filter = dataStore.getUrlFilter(params);
+
+        assertSame(fakeFilter, filter);
+        assertEquals(1, fakeFilter.includePatterns.size());
+        assertTrue(filter.match("src/main/java/App.java"));
+        assertFalse(filter.match("README.md"));
     }
 
     @Test
     public void test_getUrlFilter_withExcludePattern() {
-        GitDataStore dataStore = new GitDataStore() {
-            @Override
-            protected UrlFilter getUrlFilter(final DataStoreParams paramMap) {
-                // Call parent implementation to test it
-                UrlFilter filter = new MockUrlFilter();
-                final String exclude = paramMap.getAsString("exclude_pattern");
-                if (exclude != null && !exclude.isEmpty()) {
-                    filter.addExclude(exclude);
-                }
-                return filter;
-            }
-        };
+        final RecordingUrlFilter fakeFilter = new RecordingUrlFilter();
+        ComponentUtil.register(fakeFilter, UrlFilter.class.getCanonicalName());
+        final GitDataStore dataStore = new GitDataStore();
 
-        DataStoreParams params = new DataStoreParams();
+        final DataStoreParams params = new DataStoreParams();
         params.put("exclude_pattern", ".*\\.class");
 
-        UrlFilter filter = dataStore.getUrlFilter(params);
-        assertNotNull(filter);
+        final UrlFilter filter = dataStore.getUrlFilter(params);
+
+        assertSame(fakeFilter, filter);
+        assertEquals(1, fakeFilter.excludePatterns.size());
+        assertTrue(filter.match("App.java"));
+        assertFalse(filter.match("App.class"));
     }
 
     @Test
     public void test_getUrlFilter_withBothPatterns() {
-        GitDataStore dataStore = new GitDataStore() {
-            @Override
-            protected UrlFilter getUrlFilter(final DataStoreParams paramMap) {
-                // Call parent implementation to test it
-                UrlFilter filter = new MockUrlFilter();
-                final String include = paramMap.getAsString("include_pattern");
-                if (include != null && !include.isEmpty()) {
-                    filter.addInclude(include);
-                }
-                final String exclude = paramMap.getAsString("exclude_pattern");
-                if (exclude != null && !exclude.isEmpty()) {
-                    filter.addExclude(exclude);
-                }
-                return filter;
-            }
-        };
+        final RecordingUrlFilter fakeFilter = new RecordingUrlFilter();
+        ComponentUtil.register(fakeFilter, UrlFilter.class.getCanonicalName());
+        final GitDataStore dataStore = new GitDataStore();
 
-        DataStoreParams params = new DataStoreParams();
+        final DataStoreParams params = new DataStoreParams();
         params.put("include_pattern", ".*\\.java");
         params.put("exclude_pattern", ".*Test\\.java");
 
-        UrlFilter filter = dataStore.getUrlFilter(params);
-        assertNotNull(filter);
+        final UrlFilter filter = dataStore.getUrlFilter(params);
+
+        assertSame(fakeFilter, filter);
+        assertEquals(1, fakeFilter.includePatterns.size());
+        assertEquals(1, fakeFilter.excludePatterns.size());
+        // Matches the include pattern and not the exclude pattern.
+        assertTrue(filter.match("src/main/java/App.java"));
+        // Matches the include pattern but is also excluded.
+        assertFalse(filter.match("src/main/java/AppTest.java"));
+        // Does not even match the include pattern.
+        assertFalse(filter.match("README.md"));
+    }
+
+    /**
+     * A {@link UrlFilter} test double that implements real include/exclude matching (mirroring
+     * {@code UrlFilterImpl#match}), used as the component {@link GitDataStore#getUrlFilter} looks up so the
+     * real method's wiring (addInclude/addExclude/init calls) is exercised without needing a full crawler
+     * container (the real {@code UrlFilterImpl} depends on a DI-injected {@code CrawlerContainer} that isn't
+     * available in this lightweight unit-test container).
+     */
+    private static final class RecordingUrlFilter implements UrlFilter {
+        private final List<java.util.regex.Pattern> includePatterns = new ArrayList<>();
+        private final List<java.util.regex.Pattern> excludePatterns = new ArrayList<>();
+
+        @Override
+        public void init(final String sessionId) {
+            // no-op: init() being called at all (without throwing) is implicitly verified by every test
+            // in this class reaching its assertions, since GitDataStore#getUrlFilter calls it unconditionally.
+        }
+
+        @Override
+        public boolean match(final String url) {
+            if (!includePatterns.isEmpty() && includePatterns.stream().noneMatch(p -> p.matcher(url).matches())) {
+                return false;
+            }
+            return excludePatterns.stream().noneMatch(p -> p.matcher(url).matches());
+        }
+
+        @Override
+        public void addInclude(final String urlPattern) {
+            includePatterns.add(java.util.regex.Pattern.compile(urlPattern));
+        }
+
+        @Override
+        public void addExclude(final String urlPattern) {
+            excludePatterns.add(java.util.regex.Pattern.compile(urlPattern));
+        }
+
+        @Override
+        public void processUrl(final String url) {
+            // no-op: not exercised by getUrlFilter.
+        }
+
+        @Override
+        public void clear() {
+            includePatterns.clear();
+            excludePatterns.clear();
+        }
     }
 
     private void deleteDirectory(File directory) {
