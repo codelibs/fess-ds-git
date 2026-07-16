@@ -23,7 +23,6 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.lang.reflect.Constructor;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.file.Files;
@@ -64,6 +63,7 @@ import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 import org.eclipse.jgit.transport.FetchResult;
+import org.eclipse.jgit.transport.RefSpec;
 
 public class GitDataStoreTest extends UnitDsTestCase {
 
@@ -103,6 +103,29 @@ public class GitDataStoreTest extends UnitDsTestCase {
         tempDirs.add(dir);
         try (Git git = Git.init().setInitialBranch(initialBranch).setDirectory(dir).call()) {
             addAndCommit(git, dir, files, "initial commit");
+        }
+        return dir;
+    }
+
+    /**
+     * Creates a local scratch Git repository that advertises no {@code HEAD} ref, committing {@code files} on
+     * {@code realBranch}.
+     * <p>
+     * Pointing {@code HEAD} at a branch that does not exist makes JGit drop it from the ref advertisement: a
+     * broken symbolic ref is removed by {@code RefDirectory} ("A broken symbolic reference, we have to drop it
+     * from the collections the client is about to receive") and {@code RefAdvertiser} skips any ref with a
+     * {@code null} object id. This is the only way to produce the "{@code HEAD} is not advertised" condition
+     * over the local {@code file://} transport, which advertises {@code HEAD} for an ordinary remote -- and
+     * that condition is exactly what a protocol-v2 re-crawl hits once the local {@code HEAD} is born, so it
+     * reproduces the reported failure's precondition without needing an HTTP/v2 test server.
+     * </p>
+     */
+    private File createRepoWithUnadvertisedHead(final String realBranch, final Map<String, String> files) throws Exception {
+        final File dir = Files.createTempDirectory("fess-ds-git-nohead-").toFile();
+        tempDirs.add(dir);
+        try (Git git = Git.init().setInitialBranch(realBranch).setDirectory(dir).call()) {
+            addAndCommit(git, dir, files, "initial commit");
+            git.getRepository().updateRef(org.eclipse.jgit.lib.Constants.HEAD).link("refs/heads/nonexistent-branch");
         }
         return dir;
     }
@@ -631,10 +654,10 @@ public class GitDataStoreTest extends UnitDsTestCase {
     public void test_resolveDefaultBranch_explicitCommitIdBypass() throws Exception {
         final GitDataStore dataStore = new GitDataStore();
         // The early return fires before fetchResult/repository are touched, so null args are safe here.
-        assertEquals("refs/heads/dev", dataStore.resolveDefaultBranch(null, null, "refs/heads/dev"));
-        assertEquals("v1.2.3", dataStore.resolveDefaultBranch(null, null, "v1.2.3"));
+        assertEquals("refs/heads/dev", dataStore.resolveDefaultBranch(null, null, null, "refs/heads/dev"));
+        assertEquals("v1.2.3", dataStore.resolveDefaultBranch(null, null, null, "v1.2.3"));
         assertEquals("0123456789abcdef0123456789abcdef01234567",
-                dataStore.resolveDefaultBranch(null, null, "0123456789abcdef0123456789abcdef01234567"));
+                dataStore.resolveDefaultBranch(null, null, null, "0123456789abcdef0123456789abcdef01234567"));
     }
 
     // Bug fix: the default commit_id is the literal string "HEAD", which JGit's FetchProcess treats as a
@@ -653,11 +676,14 @@ public class GitDataStoreTest extends UnitDsTestCase {
         assertEquals("main", dataStore.resolveInitialBranch("main"));
         assertEquals("refs/heads/dev", dataStore.resolveInitialBranch("refs/heads/dev"));
         assertEquals("v1.2.3", dataStore.resolveInitialBranch("v1.2.3"));
-        // A non-default value is passed through verbatim (no special-casing). A raw SHA is returned unchanged
-        // for the same reason; whether such a commit_id fetches successfully is a separate, pre-existing
-        // concern (JGit's setInitialBranch validates against advertised ref names) and is unchanged here.
-        assertEquals("0123456789abcdef0123456789abcdef01234567",
-                dataStore.resolveInitialBranch("0123456789abcdef0123456789abcdef01234567"));
+        // A full 40-char SHA is not a branch/tag name either, so JGit's validation would reject it on every
+        // run ("Remote branch '<sha>' not found in upstream origin"). It maps to null for the same reason
+        // HEAD does; resolveToCommitId() still resolves it locally afterwards.
+        assertNull(dataStore.resolveInitialBranch("0123456789abcdef0123456789abcdef01234567"));
+        assertNull(dataStore.resolveInitialBranch("0123456789ABCDEF0123456789ABCDEF01234567"));
+        // Documented limitation: an abbreviated SHA is indistinguishable from a branch name here
+        // (ObjectId.isId matches only the full form), so it is passed through like any other name.
+        assertEquals("0123456", dataStore.resolveInitialBranch("0123456"));
     }
 
     // Bug fix (fallback): on a protocol-v2 re-crawl of a persistent repository_path the remote HEAD is not
@@ -673,7 +699,9 @@ public class GitDataStoreTest extends UnitDsTestCase {
         try (Git git = Git.open(repoDir)) {
             final Repository repo = git.getRepository();
             // A freshly-created repo's HEAD is the symbolic ref "ref: refs/heads/main".
-            assertEquals("refs/heads/main", dataStore.resolveLocalHeadTarget(repo, "HEAD"));
+            // No fetchResult/refSpec: the "still advertised?" verification is skipped and the symref target
+            // is returned as-is.
+            assertEquals("refs/heads/main", dataStore.resolveLocalHeadTarget(repo, null, null, "HEAD"));
         }
     }
 
@@ -692,38 +720,178 @@ public class GitDataStoreTest extends UnitDsTestCase {
             final ObjectId head = repo.resolve("HEAD");
             git.checkout().setName(head.name()).call();
             assertFalse(repo.exactRef("HEAD").isSymbolic());
-            assertEquals("HEAD", dataStore.resolveLocalHeadTarget(repo, "HEAD"));
+            assertEquals("HEAD", dataStore.resolveLocalHeadTarget(repo, null, null, "HEAD"));
         }
     }
 
-    // Bug fix (fallback wiring): directly exercises the headRef == null branch of resolveDefaultBranch, which
-    // the local file:// transport (always advertises HEAD) cannot reach through storeData. JGit's FetchResult
-    // has no public constructor; an empty one models a protocol-v2 re-crawl whose advertised refs carry no
-    // HEAD. resolveDefaultBranch must then return the local HEAD's symref target ("refs/heads/main"), NOT the
-    // literal "HEAD" the pre-fix code returned -- so this fails if the fallback is reverted to `return commitId`.
+    // Bug fix (end-to-end): a commit_id given as a full SHA must actually crawl. JGit validates the initial
+    // branch as a branch/tag name, so passing a SHA through failed the fetch with "Remote branch '<sha>' not
+    // found in upstream origin" on every run -- fresh clone included. resolveInitialBranch() now maps a full
+    // SHA to null (the refspec fetches the branches regardless), and the SHA is resolved locally afterwards.
+    @Test
+    public void test_storeData_withRawShaCommitId() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("a.txt", "a");
+        final File remote = createLocalRepo("main", files);
+        final String firstSha;
+        try (Git git = Git.open(remote)) {
+            firstSha = git.getRepository().resolve("refs/heads/main").name();
+            // A later commit the pinned SHA must NOT pick up, proving the SHA is what was crawled.
+            final Map<String, String> second = new LinkedHashMap<>();
+            second.put("b.txt", "b");
+            addAndCommit(git, remote, second, "c2");
+        }
+
+        final DataStoreParams params = new DataStoreParams();
+        params.put("uri", remote.getAbsolutePath());
+        params.put("commit_id", firstSha);
+
+        final List<String> urlList = new ArrayList<>();
+        newCollectingDataStore(urlList).storeData(null, null, params, null, null);
+
+        assertTrue(urlList.contains("a.txt"));
+        assertFalse(urlList.contains("b.txt"));
+    }
+
+    // Bug fix (fallback wiring): exercises the headRef == null branch of resolveDefaultBranch using a REAL
+    // FetchResult from a real fetch against a remote that genuinely advertises no HEAD (see
+    // createRepoWithUnadvertisedHead) -- the same "HEAD absent from the advertisement" shape a protocol-v2
+    // re-crawl produces. resolveDefaultBranch must then return the local HEAD's symref target
+    // ("refs/heads/foo"), NOT the literal "HEAD" the pre-fix code returned -- so this fails if the fallback is
+    // reverted to `return commitId`.
     @Test
     public void test_resolveDefaultBranch_fallsBackToLocalHeadWhenHeadNotAdvertised() throws Exception {
         final Map<String, String> files = new LinkedHashMap<>();
         files.put("a.txt", "a");
-        final File repoDir = createLocalRepo("main", files);
-        final GitDataStore dataStore = new GitDataStore();
-        try (Git git = Git.open(repoDir)) {
-            final Repository repo = git.getRepository();
-            final Constructor<FetchResult> ctor = FetchResult.class.getDeclaredConstructor();
-            ctor.setAccessible(true);
-            final FetchResult emptyFetchResult = ctor.newInstance();
-            assertNull(emptyFetchResult.getAdvertisedRef("HEAD"));
-            assertEquals("refs/heads/main", dataStore.resolveDefaultBranch(repo, emptyFetchResult, "HEAD"));
+        final File remote = createRepoWithUnadvertisedHead("foo", files);
+
+        final File localDir = Files.createTempDirectory("fess-ds-git-local-").toFile();
+        tempDirs.add(localDir);
+        final Repository local = FileRepositoryBuilder.create(new File(localDir, ".git"));
+        local.create();
+        try (Git git = new Git(local)) {
+            final FetchResult fetchResult = git.fetch()
+                    .setForceUpdate(true)
+                    .setRemote(remote.getAbsolutePath())
+                    .setRefSpecs(new RefSpec("+refs/heads/*:refs/heads/*"))
+                    .call();
+            // Not a synthetic stand-in: the remote really advertised no HEAD.
+            assertNull(fetchResult.getAdvertisedRef("HEAD"));
+            // The symref a previous crawl's linkLocalHead() would have established.
+            local.updateRef(org.eclipse.jgit.lib.Constants.HEAD).link("refs/heads/foo");
+
+            final GitDataStore dataStore = new GitDataStore();
+            assertEquals("refs/heads/foo",
+                    dataStore.resolveDefaultBranch(local, fetchResult, new RefSpec("+refs/heads/*:refs/heads/*"), "HEAD"));
+        } finally {
+            local.close();
         }
+    }
+
+    // The local HEAD is only a cache of what the remote's default branch was on the FIRST crawl. If that branch
+    // is renamed/deleted upstream it is not pruned locally (the fetch sets no removeDeletedRefs) and still
+    // resolves to its last-known commit, so trusting it would diff that commit against itself: zero documents
+    // indexed, crawl reported successful. Verify the stale target is rejected with an actionable error instead.
+    @Test
+    public void test_resolveLocalHeadTarget_failsWhenTargetNoLongerAdvertised() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("a.txt", "a");
+        // Remote advertises refs/heads/main (and no HEAD); the local HEAD still points at the old refs/heads/master.
+        final File remote = createRepoWithUnadvertisedHead("main", files);
+
+        final File localDir = Files.createTempDirectory("fess-ds-git-local-").toFile();
+        tempDirs.add(localDir);
+        final Repository local = FileRepositoryBuilder.create(new File(localDir, ".git"));
+        local.create();
+        try (Git git = new Git(local)) {
+            final FetchResult fetchResult = git.fetch()
+                    .setForceUpdate(true)
+                    .setRemote(remote.getAbsolutePath())
+                    .setRefSpecs(new RefSpec("+refs/heads/*:refs/heads/*"))
+                    .call();
+            local.updateRef(org.eclipse.jgit.lib.Constants.HEAD).link("refs/heads/master");
+
+            final GitDataStore dataStore = new GitDataStore();
+            try {
+                dataStore.resolveLocalHeadTarget(local, fetchResult, new RefSpec("+refs/heads/*:refs/heads/*"), "HEAD");
+                fail("Expected DataStoreException for a default branch that vanished upstream");
+            } catch (final DataStoreException e) {
+                assertTrue(e.getMessage().contains("refs/heads/master"));
+            }
+        } finally {
+            local.close();
+        }
+    }
+
+    // The "still advertised?" check must not fire when the refspec simply does not cover the local HEAD: with a
+    // narrowed ref_specs the advertisement is filtered to that prefix, so a HEAD pointing outside it is
+    // legitimately absent and must not be mistaken for a branch deleted upstream.
+    @Test
+    public void test_resolveLocalHeadTarget_narrowedRefSpecDoesNotFalselyFail() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("a.txt", "a");
+        final File remote = createRepoWithUnadvertisedHead("main", files);
+
+        final File localDir = Files.createTempDirectory("fess-ds-git-local-").toFile();
+        tempDirs.add(localDir);
+        final Repository local = FileRepositoryBuilder.create(new File(localDir, ".git"));
+        local.create();
+        try (Git git = new Git(local)) {
+            final FetchResult fetchResult = git.fetch()
+                    .setForceUpdate(true)
+                    .setRemote(remote.getAbsolutePath())
+                    .setRefSpecs(new RefSpec("+refs/heads/*:refs/heads/*"))
+                    .call();
+            local.updateRef(org.eclipse.jgit.lib.Constants.HEAD).link("refs/heads/other");
+
+            // refs/heads/other is outside this refspec, so its absence proves nothing and must be tolerated.
+            final GitDataStore dataStore = new GitDataStore();
+            assertEquals("refs/heads/other",
+                    dataStore.resolveLocalHeadTarget(local, fetchResult, new RefSpec("+refs/heads/main:refs/heads/main"), "HEAD"));
+        } finally {
+            local.close();
+        }
+    }
+
+    // Bug fix (root cause, end-to-end): reproduces the reported failure hermetically. When the remote does not
+    // advertise HEAD, JGit's FetchProcess.isInitialBranchMissing rejects the literal "HEAD" that the pre-fix
+    // code passed to setInitialBranch, failing the fetch with the exact reported error ("Remote branch 'HEAD'
+    // not found in upstream origin"). resolveInitialBranch() maps the default commit_id to null, selecting
+    // JGit's "use the branch pointed to by HEAD" behavior, so the fetch succeeds and the crawl proceeds via
+    // the local HEAD fallback. Reverting either half of the fix fails this test.
+    @Test
+    public void test_storeData_succeedsWhenRemoteDoesNotAdvertiseHead() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("a.txt", "a");
+        final File remote = createRepoWithUnadvertisedHead("foo", files);
+
+        // Model a persistent repository_path left by a previous crawl: the repo exists and its HEAD is already
+        // linked to the branch that crawl resolved -- the state in which the reported failure occurred. HEAD is
+        // linked explicitly rather than relying on JGit's default init branch, which init.defaultBranch can change.
+        final File persistent = Files.createTempDirectory("fess-ds-git-nohead-persist-").toFile();
+        tempDirs.add(persistent);
+        final Repository seeded = FileRepositoryBuilder.create(new File(persistent, ".git"));
+        seeded.create();
+        seeded.updateRef(org.eclipse.jgit.lib.Constants.HEAD).link("refs/heads/foo");
+        seeded.close();
+
+        final DataStoreParams params = new DataStoreParams();
+        params.put("uri", remote.getAbsolutePath());
+        params.put("repository_path", persistent.getAbsolutePath());
+
+        final List<String> urlList = new ArrayList<>();
+        newCollectingDataStore(urlList).storeData(null, null, params, null, null);
+
+        assertTrue(urlList.contains("a.txt"));
     }
 
     // Bug fix (end-to-end): a re-crawl against a persistent repository_path (where the local HEAD is already
     // born) must succeed and stay incremental. This is the scenario that triggered the reported
-    // "Remote branch 'HEAD' not found in upstream origin" crash. (The local file:// transport used here
-    // always advertises HEAD, so this test guards the whole persistent re-crawl flow -- including that the
-    // resolved ref / prev_source_ref stays stable so the second run is incremental; the v2-specific
-    // mechanics a local transport cannot reproduce are covered by test_resolveInitialBranch() and
-    // test_resolveLocalHeadTarget_*.)
+    // "Remote branch 'HEAD' not found in upstream origin" crash. (This remote is an ordinary one, which the
+    // local file:// transport does advertise a HEAD for, so this test guards the whole persistent re-crawl
+    // flow -- including that the resolved ref / prev_source_ref stays stable so the second run is
+    // incremental. The failure itself, which needs a remote that advertises no HEAD, is covered by
+    // test_storeData_succeedsWhenRemoteDoesNotAdvertiseHead().)
     @Test
     public void test_storeData_persistentRepositoryRecrawl() throws Exception {
         final Map<String, String> files = new LinkedHashMap<>();
