@@ -23,6 +23,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Constructor;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.file.Files;
@@ -62,6 +63,7 @@ import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
+import org.eclipse.jgit.transport.FetchResult;
 
 public class GitDataStoreTest extends UnitDsTestCase {
 
@@ -633,6 +635,193 @@ public class GitDataStoreTest extends UnitDsTestCase {
         assertEquals("v1.2.3", dataStore.resolveDefaultBranch(null, null, "v1.2.3"));
         assertEquals("0123456789abcdef0123456789abcdef01234567",
                 dataStore.resolveDefaultBranch(null, null, "0123456789abcdef0123456789abcdef01234567"));
+    }
+
+    // Bug fix: the default commit_id is the literal string "HEAD", which JGit's FetchProcess treats as a
+    // concrete branch name and validates against the advertised refs. Under protocol v2 the remote HEAD is
+    // only advertised when JGit requests it (an unborn local HEAD), so a re-crawl of a persistent
+    // repository_path (born local HEAD) fails with "Remote branch 'HEAD' not found in upstream origin".
+    // resolveInitialBranch() maps the default HEAD/blank case to null (JGit's "use the default branch"
+    // sentinel) while pinning an explicitly configured branch/tag unchanged.
+    @Test
+    public void test_resolveInitialBranch() {
+        final GitDataStore dataStore = new GitDataStore();
+        assertNull(dataStore.resolveInitialBranch("HEAD"));
+        assertNull(dataStore.resolveInitialBranch(null));
+        assertNull(dataStore.resolveInitialBranch(""));
+        assertNull(dataStore.resolveInitialBranch("   "));
+        assertEquals("main", dataStore.resolveInitialBranch("main"));
+        assertEquals("refs/heads/dev", dataStore.resolveInitialBranch("refs/heads/dev"));
+        assertEquals("v1.2.3", dataStore.resolveInitialBranch("v1.2.3"));
+        // A non-default value is passed through verbatim (no special-casing). A raw SHA is returned unchanged
+        // for the same reason; whether such a commit_id fetches successfully is a separate, pre-existing
+        // concern (JGit's setInitialBranch validates against advertised ref names) and is unchanged here.
+        assertEquals("0123456789abcdef0123456789abcdef01234567",
+                dataStore.resolveInitialBranch("0123456789abcdef0123456789abcdef01234567"));
+    }
+
+    // Bug fix (fallback): on a protocol-v2 re-crawl of a persistent repository_path the remote HEAD is not
+    // advertised, so resolveDefaultBranch() falls back to the local HEAD's symref target (established by the
+    // first crawl) instead of the literal "HEAD" -- keeping the resolved ref, and thus prev_source_ref,
+    // stable across runs. A symbolic local HEAD resolves to its target branch.
+    @Test
+    public void test_resolveLocalHeadTarget_symbolicHead() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("a.txt", "a");
+        final File repoDir = createLocalRepo("main", files);
+        final GitDataStore dataStore = new GitDataStore();
+        try (Git git = Git.open(repoDir)) {
+            final Repository repo = git.getRepository();
+            // A freshly-created repo's HEAD is the symbolic ref "ref: refs/heads/main".
+            assertEquals("refs/heads/main", dataStore.resolveLocalHeadTarget(repo, "HEAD"));
+        }
+    }
+
+    // Bug fix (fallback): when the local HEAD is detached (no symref, e.g. detached/anonymous history), there
+    // is no branch name to recover, so resolveLocalHeadTarget() returns the configured commitId unchanged,
+    // preserving the prior behavior.
+    @Test
+    public void test_resolveLocalHeadTarget_detachedHeadReturnsCommitId() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("a.txt", "a");
+        final File repoDir = createLocalRepo("main", files);
+        final GitDataStore dataStore = new GitDataStore();
+        try (Git git = Git.open(repoDir)) {
+            final Repository repo = git.getRepository();
+            // Checking out a commit id (not a branch) detaches HEAD.
+            final ObjectId head = repo.resolve("HEAD");
+            git.checkout().setName(head.name()).call();
+            assertFalse(repo.exactRef("HEAD").isSymbolic());
+            assertEquals("HEAD", dataStore.resolveLocalHeadTarget(repo, "HEAD"));
+        }
+    }
+
+    // Bug fix (fallback wiring): directly exercises the headRef == null branch of resolveDefaultBranch, which
+    // the local file:// transport (always advertises HEAD) cannot reach through storeData. JGit's FetchResult
+    // has no public constructor; an empty one models a protocol-v2 re-crawl whose advertised refs carry no
+    // HEAD. resolveDefaultBranch must then return the local HEAD's symref target ("refs/heads/main"), NOT the
+    // literal "HEAD" the pre-fix code returned -- so this fails if the fallback is reverted to `return commitId`.
+    @Test
+    public void test_resolveDefaultBranch_fallsBackToLocalHeadWhenHeadNotAdvertised() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("a.txt", "a");
+        final File repoDir = createLocalRepo("main", files);
+        final GitDataStore dataStore = new GitDataStore();
+        try (Git git = Git.open(repoDir)) {
+            final Repository repo = git.getRepository();
+            final Constructor<FetchResult> ctor = FetchResult.class.getDeclaredConstructor();
+            ctor.setAccessible(true);
+            final FetchResult emptyFetchResult = ctor.newInstance();
+            assertNull(emptyFetchResult.getAdvertisedRef("HEAD"));
+            assertEquals("refs/heads/main", dataStore.resolveDefaultBranch(repo, emptyFetchResult, "HEAD"));
+        }
+    }
+
+    // Bug fix (end-to-end): a re-crawl against a persistent repository_path (where the local HEAD is already
+    // born) must succeed and stay incremental. This is the scenario that triggered the reported
+    // "Remote branch 'HEAD' not found in upstream origin" crash. (The local file:// transport used here
+    // always advertises HEAD, so this test guards the whole persistent re-crawl flow -- including that the
+    // resolved ref / prev_source_ref stays stable so the second run is incremental; the v2-specific
+    // mechanics a local transport cannot reproduce are covered by test_resolveInitialBranch() and
+    // test_resolveLocalHeadTarget_*.)
+    @Test
+    public void test_storeData_persistentRepositoryRecrawl() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("a.txt", "a");
+        final File remote = createLocalRepo("main", files);
+
+        final File persistent = Files.createTempDirectory("fess-ds-git-persist-").toFile();
+        tempDirs.add(persistent);
+
+        // First crawl: fresh persistent repository_path (unborn local HEAD). Capture what gets persisted so
+        // the second run can be driven exactly as Fess's write-back would drive it.
+        final DataStoreParams firstParams = new DataStoreParams();
+        firstParams.put("uri", remote.getAbsolutePath());
+        firstParams.put("repository_path", persistent.getAbsolutePath());
+        final List<String> firstUrls = new ArrayList<>();
+        final AtomicReference<String> sourceRef = new AtomicReference<>();
+        final AtomicReference<ObjectId> commitId = new AtomicReference<>();
+        final GitDataStore firstRun = new GitDataStore() {
+            @Override
+            protected UrlFilter getUrlFilter(final DataStoreParams paramMap) {
+                return new MockUrlFilter();
+            }
+
+            @Override
+            protected void processFile(final DataConfig dataConfig, final IndexUpdateCallback callback, final DataStoreParams paramMap,
+                    final Map<String, String> scriptMap, final Map<String, Object> defaultDataMap, final Map<String, Object> configMap) {
+                firstUrls.add(((DiffEntry) configMap.get(DIFF_ENTRY)).getNewPath());
+            }
+
+            @Override
+            protected void updateDataConfig(final DataConfig dc, final String ref, final ObjectId toCommitId) {
+                sourceRef.set(ref);
+                commitId.set(toCommitId);
+            }
+        };
+        firstRun.storeData(new DataConfig(), null, firstParams, null, null);
+        assertTrue(firstUrls.contains("a.txt"));
+        assertNotNull(sourceRef.get());
+        assertNotNull(commitId.get());
+
+        // A new commit lands upstream between crawls.
+        try (Git git = Git.open(remote)) {
+            final Map<String, String> second = new LinkedHashMap<>();
+            second.put("b.txt", "b");
+            addAndCommit(git, remote, second, "c2");
+        }
+
+        // Second crawl: the persistent repository_path now has a born local HEAD -- the exact state that made
+        // setInitialBranch("HEAD") throw. It must succeed and, because prev_source_ref matches, be incremental.
+        final DataStoreParams secondParams = new DataStoreParams();
+        secondParams.put("uri", remote.getAbsolutePath());
+        secondParams.put("repository_path", persistent.getAbsolutePath());
+        secondParams.put("prev_commit_id", commitId.get().name());
+        secondParams.put("prev_source_ref", sourceRef.get());
+        final List<String> secondUrls = new ArrayList<>();
+        newCollectingDataStore(secondUrls).storeData(null, null, secondParams, null, null);
+
+        assertTrue(secondUrls.contains("b.txt"));
+        assertFalse(secondUrls.contains("a.txt"));
+    }
+
+    // Bug fix (initial-branch wiring): proves storeData() passes resolveInitialBranch()'s result -- not the raw
+    // commit_id -- to FetchCommand.setInitialBranch(). resolveInitialBranch is overridden to return a branch
+    // that does not exist on the remote, so JGit's isInitialBranchMissing check fails the fetch with that exact
+    // name. If storeData instead passed the literal commit_id "HEAD" (the pre-fix behavior), the local
+    // transport would advertise HEAD and the crawl would succeed -- so this fails if the wiring is reverted.
+    @Test
+    public void test_storeData_usesResolvedInitialBranchForFetch() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("a.txt", "a");
+        final File remote = createLocalRepo("main", files);
+
+        final DataStoreParams params = new DataStoreParams();
+        params.put("uri", remote.getAbsolutePath());
+        final GitDataStore dataStore = new GitDataStore() {
+            @Override
+            protected UrlFilter getUrlFilter(final DataStoreParams paramMap) {
+                return new MockUrlFilter();
+            }
+
+            @Override
+            protected String resolveInitialBranch(final String commitId) {
+                return "does-not-exist-branch";
+            }
+        };
+        try {
+            dataStore.storeData(null, null, params, null, null);
+            fail("Expected DataStoreException");
+        } catch (final DataStoreException e) {
+            boolean found = false;
+            for (Throwable t = e; t != null; t = t.getCause()) {
+                if (t.getMessage() != null && t.getMessage().contains("does-not-exist-branch")) {
+                    found = true;
+                    break;
+                }
+            }
+            assertTrue("Expected the fetch to fail on the missing initial branch, but got: " + e, found);
+        }
     }
 
     // Fix #11: for a brand-new (not-yet-existing) repository_path, the advisory lock must be acquired BEFORE
