@@ -271,21 +271,26 @@ public class GitDataStore extends AbstractDataStore {
         final Repository repository = (Repository) configMap.get(REPOSITORY);
         try (final Git git = new Git(repository)) {
             configMap.put(GIT, git);
+            final RefSpec fetchRefSpec = new RefSpec(refSpec);
             final FetchResult fetchResult = git.fetch()
                     .setForceUpdate(true)
                     .setRemote(uri)
-                    .setRefSpecs(new RefSpec(refSpec))
-                    .setInitialBranch(commitId)
+                    .setRefSpecs(fetchRefSpec)
+                    .setInitialBranch(resolveInitialBranch(commitId))
                     .setCredentialsProvider(credentialsProvider)
                     .call();
             if (logger.isDebugEnabled()) {
                 logger.debug("Fetch Result: {}", fetchResult.getMessages());
             }
-            final String resolvedCommitId = resolveDefaultBranch(repository, fetchResult, commitId);
+            final String resolvedCommitId = resolveDefaultBranch(repository, fetchResult, fetchRefSpec, commitId);
             if (!hasCommitLogs(configMap)) {
                 final Ref ref = git.checkout().setName(resolvedCommitId).call();
                 if (logger.isDebugEnabled()) {
-                    logger.debug("Checked out {}", ref.getName());
+                    // CheckoutCommand.call() returns null when the checkout detaches HEAD: it looks the name up
+                    // with findRef() and keeps only a refs/heads/* match, so a commit SHA (an explicit commit_id,
+                    // or resolveDefaultBranch()'s bare-SHA result for anonymous history) yields null while HEAD is
+                    // force-updated to the commit. Log the resolved ref rather than dereferencing that null.
+                    logger.debug("Checked out {}", ref != null ? ref.getName() : resolvedCommitId);
                 }
             }
             final String currentSourceRef = redactUrl(uri) + "#" + resolvedCommitId;
@@ -466,6 +471,47 @@ public class GitDataStore extends AbstractDataStore {
     }
 
     /**
+     * Determines the value to pass to JGit's
+     * {@link org.eclipse.jgit.api.FetchCommand#setInitialBranch(String)}.
+     * <p>
+     * JGit validates the initial branch as a concrete branch/tag name against the refs advertised by the
+     * remote ({@code FetchProcess.isInitialBranchMissing}). The default {@code commit_id} is the literal
+     * string {@code "HEAD"}, which is <em>not</em> a branch name: under protocol v2 the remote {@code HEAD}
+     * is advertised only when JGit itself requests it (an unborn local {@code HEAD}), so on a re-crawl of a
+     * persistent {@code repository_path} -- where the local {@code HEAD} is already born -- it is absent and
+     * the fetch fails with {@code "Remote branch 'HEAD' not found in upstream origin"}. Returning
+     * {@code null} for the default {@code HEAD}/blank case selects JGit's documented "use the branch pointed
+     * to by HEAD" behavior (equivalent to not calling {@code setInitialBranch} at all), while an explicitly
+     * configured branch/tag is still pinned unchanged so the common non-default case behaves exactly as
+     * before.
+     * </p>
+     * <p>
+     * A {@code commit_id} that is a full 40-character object id is mapped to {@code null} for the same
+     * reason: a SHA is not a branch or tag name either, so JGit's validation rejects it and the fetch fails
+     * with {@code "Remote branch '<sha>' not found in upstream origin"} on <em>every</em> run. Skipping the
+     * validation is safe because the refspec fetches the branches regardless, and
+     * {@link #resolveToCommitId(Repository, String, String)} then resolves the SHA against the local
+     * repository (failing with a clear message if it is not reachable from any fetched ref).
+     * </p>
+     * <p>
+     * Known limitation: an <em>abbreviated</em> SHA (e.g. {@code 6973e6a}) is not recognized here --
+     * {@link ObjectId#isId(String)} matches only the full 40-character form -- and is therefore still passed
+     * through and still rejected by JGit's validation. It is indistinguishable from a legitimate branch name
+     * at this point (a branch may literally be named {@code 6973e6a}), so it is left to the existing
+     * branch/tag handling rather than guessed at.
+     * </p>
+     *
+     * @param commitId The configured {@code commit_id}.
+     * @return The concrete branch/tag to pin, or {@code null} to use the remote's default branch.
+     */
+    protected String resolveInitialBranch(final String commitId) {
+        if (StringUtil.isBlank(commitId) || org.eclipse.jgit.lib.Constants.HEAD.equals(commitId) || ObjectId.isId(commitId)) {
+            return null;
+        }
+        return commitId;
+    }
+
+    /**
      * Resolves the commit reference to use for checkout and diffing.
      * <p>
      * When {@code commitId} defaults to {@link org.eclipse.jgit.lib.Constants#HEAD} (or is blank), the
@@ -484,21 +530,33 @@ public class GitDataStore extends AbstractDataStore {
      * would otherwise make {@link #isSameSource(String, String)} flip-flop across runs with no actual
      * branch/uri change, since the SHA moves as the branch advances.
      * </p>
+     * <p>
+     * On a re-crawl of a persistent {@code repository_path} the remote {@code HEAD} is often not advertised
+     * at all: under protocol v2, JGit only requests {@code HEAD} when the local {@code HEAD} is unborn, so
+     * once the first crawl has borne it the ref advertisement is filtered to the fetch refspec's prefixes
+     * (e.g. {@code refs/heads/}) and carries no {@code HEAD}. In that case the local {@code HEAD}'s symref
+     * target -- established by the first crawl -- is used via
+     * {@link #resolveLocalHeadTarget(Repository, FetchResult, RefSpec, String)} instead of falling back to the
+     * literal {@code "HEAD"} string, which would otherwise make {@code prev_source_ref} flip-flop between
+     * {@code refs/heads/main} and {@code HEAD} and force a spurious full reindex.
+     * </p>
      *
      * @param repository The Git repository.
      * @param fetchResult The result of the fetch operation.
+     * @param refSpec The refspec used for the fetch, used to tell a branch deleted upstream apart from one the
+     *            refspec simply does not cover; may be {@code null} to skip that check.
      * @param commitId The configured commit ID.
      * @return The resolved commit reference to use for checkout and resolution.
      * @throws IOException If updating the local {@code HEAD} fails.
      */
-    protected String resolveDefaultBranch(final Repository repository, final FetchResult fetchResult, final String commitId)
-            throws IOException {
+    protected String resolveDefaultBranch(final Repository repository, final FetchResult fetchResult, final RefSpec refSpec,
+            final String commitId) throws IOException {
         if (StringUtil.isNotBlank(commitId) && !org.eclipse.jgit.lib.Constants.HEAD.equals(commitId)) {
             return commitId;
         }
         final Ref headRef = fetchResult.getAdvertisedRef(org.eclipse.jgit.lib.Constants.HEAD);
         if (headRef == null) {
-            return commitId;
+            return resolveLocalHeadTarget(repository, fetchResult, refSpec, commitId);
         }
         if (headRef.isSymbolic()) {
             final String targetName = headRef.getTarget().getName();
@@ -511,6 +569,54 @@ public class GitDataStore extends AbstractDataStore {
             return matchedBranch;
         }
         return headRef.getObjectId().name();
+    }
+
+    /**
+     * Resolves the local {@code HEAD}'s symbolic target (e.g. {@code refs/heads/main}). Used as a fallback by
+     * {@link #resolveDefaultBranch(Repository, FetchResult, RefSpec, String)} when the remote {@code HEAD} is
+     * not advertised on a fetch (a protocol-v2 re-crawl of a persistent {@code repository_path} whose local
+     * {@code HEAD} is already born). Returning the symref target keeps the resolved ref -- and therefore
+     * {@code prev_source_ref} -- identical to what the first crawl recorded, so incremental crawling keeps
+     * working across runs. When the local {@code HEAD} is missing or detached (no symref, e.g.
+     * detached/anonymous history), {@code commitId} is returned unchanged, preserving the prior behavior.
+     * <p>
+     * The local {@code HEAD} is a cached copy of what the remote's default branch was on the <em>first</em>
+     * crawl, so it is verified against the current advertisement before being trusted. If the remote's default
+     * branch is renamed or deleted (e.g. {@code master} -> {@code main}), the stale local branch is not pruned
+     * by the fetch (no {@code setRemoveDeletedRefs(true)}, and it is no longer advertised to be updated), so it
+     * still resolves -- to its last-known commit. Silently trusting it would diff that unchanged commit against
+     * itself, index nothing, and report success, which (unless {@code delete_old_docs=false}) additionally lets
+     * Fess prune every previously-indexed document of this config. Failing with an actionable message is
+     * strictly more diagnosable than that.
+     * </p>
+     * <p>
+     * The check is gated on {@code refSpec} actually covering the target: with a narrowed {@code ref_specs}
+     * (e.g. {@code +refs/heads/foo:refs/heads/foo}) the advertisement is filtered to that prefix, so a local
+     * {@code HEAD} pointing outside it is legitimately absent and must not be mistaken for one deleted upstream.
+     * </p>
+     *
+     * @param repository The Git repository.
+     * @param fetchResult The result of the fetch operation, whose advertised refs the target is verified
+     *            against; may be {@code null} to skip that verification.
+     * @param refSpec The refspec used for the fetch; the verification is skipped unless it covers the target.
+     * @param commitId The configured commit ID, returned unchanged when the local {@code HEAD} is not symbolic.
+     * @return The local {@code HEAD}'s symref target, or {@code commitId} if it is missing or detached.
+     * @throws IOException If reading the local {@code HEAD} fails.
+     */
+    protected String resolveLocalHeadTarget(final Repository repository, final FetchResult fetchResult, final RefSpec refSpec,
+            final String commitId) throws IOException {
+        final Ref localHead = repository.exactRef(org.eclipse.jgit.lib.Constants.HEAD);
+        if (localHead == null || !localHead.isSymbolic()) {
+            return commitId;
+        }
+        final String targetName = localHead.getTarget().getName();
+        if (fetchResult != null && refSpec != null && refSpec.matchSource(targetName) && fetchResult.getAdvertisedRef(targetName) == null) {
+            throw new DataStoreException("The branch '" + targetName
+                    + "' that a previous crawl resolved as this repository's default branch is no longer advertised by the remote; "
+                    + "it was most likely renamed or deleted upstream. Set commit_id to the new branch name, or remove the "
+                    + "repository_path directory so the remote's current default branch is picked up again.");
+        }
+        return targetName;
     }
 
     /**
@@ -528,7 +634,7 @@ public class GitDataStore extends AbstractDataStore {
 
     /**
      * Scans the given advertised refs for one under {@code refs/heads/} whose object id matches {@code headId}.
-     * Used by {@link #resolveDefaultBranch(Repository, FetchResult, String)} to identify a branch name by
+     * Used by {@link #resolveDefaultBranch(Repository, FetchResult, RefSpec, String)} to identify a branch name by
      * content when the advertised {@code HEAD} is not symbolic. This is similar in intent to JGit's own
      * {@code CloneCommand#findBranchToCheckout(FetchResult)}, but does NOT replicate its tiebreak: when several
      * advertised branches share {@code HEAD}'s object id, JGit specially prefers {@code refs/heads/master},
