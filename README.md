@@ -22,7 +22,7 @@ Parameter:
 
 ```
 uri=https://github.com/codelibs/fess-ds-git.git
-base_url=https://github.com/codelibs/fess/blob/master/
+base_url=https://github.com/codelibs/fess/blob/main/
 extractors=text/.*:textExtractor,application/xml:textExtractor,application/javascript:textExtractor,
 prev_commit_id=
 # delete_old_docs is a framework-level parameter handled by Fess's crawling infrastructure (DataIndexHelper),

@@ -162,7 +162,7 @@ public class GitDataStoreTest extends UnitDsTestCase {
 
         DataStoreParams params = new DataStoreParams();
         params.put("uri", remote.getAbsolutePath());
-        params.put("base_url", "https://github.com/codelibs/fess-ds-git/blob/master/");
+        params.put("base_url", "https://github.com/codelibs/fess-ds-git/blob/main/");
         params.put("extractors",
                 "text/.*:textExtractor,application/xml:textExtractor,application/javascript:textExtractor,application/json:textExtractor,application/x-sh:textExtractor,application/x-bat:textExtractor,audio/.*:filenameExtractor,chemical/.*:filenameExtractor,image/.*:filenameExtractor,model/.*:filenameExtractor,video/.*:filenameExtractor,");
         final List<String> urlList = new ArrayList<>();
