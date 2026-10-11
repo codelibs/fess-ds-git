@@ -68,6 +68,7 @@ import org.codelibs.fess.opensearch.config.exentity.DataConfig;
 import org.codelibs.fess.util.ComponentUtil;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.api.errors.RefNotFoundException;
 import org.eclipse.jgit.diff.DiffEntry;
 import org.eclipse.jgit.diff.DiffFormatter;
 import org.eclipse.jgit.lib.ObjectId;
@@ -284,7 +285,12 @@ public class GitDataStore extends AbstractDataStore {
             }
             final String resolvedCommitId = resolveDefaultBranch(repository, fetchResult, fetchRefSpec, commitId);
             if (!hasCommitLogs(configMap)) {
-                final Ref ref = git.checkout().setName(resolvedCommitId).call();
+                final Ref ref;
+                try {
+                    ref = git.checkout().setName(resolvedCommitId).call();
+                } catch (final RefNotFoundException e) {
+                    throw new DataStoreException(unresolvedCommitIdMessage(commitId, resolvedCommitId), e);
+                }
                 if (logger.isDebugEnabled()) {
                     // CheckoutCommand.call() returns null when the checkout detaches HEAD: it looks the name up
                     // with findRef() and keeps only a refs/heads/* match, so a commit SHA (an explicit commit_id,
@@ -676,13 +682,31 @@ public class GitDataStore extends AbstractDataStore {
             throws IOException {
         final ObjectId toCommitId = repository.resolve(resolvedCommitId);
         if (toCommitId == null) {
-            // Report the ref that actually failed to resolve (resolvedCommitId), not the configured commit_id:
-            // e.g. a configured "HEAD" resolves to "refs/heads/main", and it is that resolved ref which was
-            // unresolvable. The original configured value is still included for context.
-            throw new DataStoreException("Could not resolve commit_id '" + resolvedCommitId + "' (configured commit_id was '" + commitId
-                    + "'). The branch/tag may not exist, or may have been renamed/deleted upstream.");
+            throw new DataStoreException(unresolvedCommitIdMessage(commitId, resolvedCommitId));
         }
         return toCommitId;
+    }
+
+    /**
+     * Builds the message for a {@code commit_id} that cannot be resolved against the fetched refs.
+     * <p>
+     * The default {@code ref_specs} ({@code +refs/heads/*:refs/heads/*}) fetch branches only, so a tag name is
+     * never available locally unless {@code ref_specs} also covers {@code refs/tags/*}. The message says so,
+     * because the underlying JGit error ("Ref v1.0 cannot be resolved") gives no hint.
+     * </p>
+     *
+     * @param commitId The configured commit ID.
+     * @param resolvedCommitId The resolved commit reference that could not be found.
+     * @return The error message.
+     */
+    protected String unresolvedCommitIdMessage(final String commitId, final String resolvedCommitId) {
+        // Report the ref that actually failed to resolve (resolvedCommitId), not the configured commit_id:
+        // e.g. a configured "HEAD" resolves to "refs/heads/main", and it is that resolved ref which was
+        // unresolvable. The original configured value is still included for context.
+        return "Could not resolve commit_id '" + resolvedCommitId + "' (configured commit_id was '" + commitId
+                + "'). The branch/tag may not exist, or may have been renamed/deleted upstream. "
+                + "Note that the default ref_specs fetch branches only: to use a tag as commit_id, "
+                + "set ref_specs to include it, e.g. ref_specs=+refs/tags/*:refs/tags/*";
     }
 
     /**
