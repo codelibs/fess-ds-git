@@ -753,6 +753,80 @@ public class GitDataStoreTest extends UnitDsTestCase {
         assertFalse(urlList.contains("b.txt"));
     }
 
+    /** Creates a local repo on branch "main" whose first commit carries the tag "v1.0"; a second commit follows. */
+    private File createTaggedRepo() throws Exception {
+        final File dir = Files.createTempDirectory("fess-ds-git-tag-").toFile();
+        tempDirs.add(dir);
+        try (Git git = Git.init().setInitialBranch("main").setDirectory(dir).call()) {
+            final Map<String, String> first = new LinkedHashMap<>();
+            first.put("a.txt", "first");
+            addAndCommit(git, dir, first, "c1");
+            git.tag().setName("v1.0").setAnnotated(false).call();
+            final Map<String, String> second = new LinkedHashMap<>();
+            second.put("b.txt", "second");
+            addAndCommit(git, dir, second, "c2");
+        }
+        return dir;
+    }
+
+    // A tag given as commit_id is not fetched by the default ref_specs (branches only). The checkout then fails
+    // with JGit's bare "Ref v1.0 cannot be resolved"; the error must instead point at ref_specs.
+    @Test
+    public void test_storeData_tagCommitIdWithDefaultRefSpecsExplainsRefSpecs() throws Exception {
+        final File remote = createTaggedRepo();
+
+        final DataStoreParams params = new DataStoreParams();
+        params.put("uri", remote.getAbsolutePath());
+        params.put("commit_id", "v1.0");
+
+        final List<String> urlList = new ArrayList<>();
+        try {
+            newCollectingDataStore(urlList).storeData(null, null, params, null, null);
+            fail("Expected DataStoreException");
+        } catch (final DataStoreException e) {
+            // storeData() wraps the failure; the actionable message is the cause's.
+            final String message = e.getCause().getMessage();
+            assertTrue(message, message.contains("v1.0"));
+            assertTrue(message, message.contains("ref_specs"));
+            assertTrue(message, message.contains("+refs/tags/*:refs/tags/*"));
+        }
+        assertTrue(urlList.isEmpty());
+    }
+
+    // The documented way to crawl a tag: add the tags refspec. The tag's commit (not the later branch tip) is crawled.
+    @Test
+    public void test_storeData_tagCommitIdWithTagRefSpec() throws Exception {
+        final File remote = createTaggedRepo();
+
+        final DataStoreParams params = new DataStoreParams();
+        params.put("uri", remote.getAbsolutePath());
+        params.put("commit_id", "v1.0");
+        params.put("ref_specs", "+refs/tags/*:refs/tags/*");
+
+        final List<String> urlList = new ArrayList<>();
+        newCollectingDataStore(urlList).storeData(null, null, params, null, null);
+
+        assertTrue(urlList.contains("a.txt"));
+        assertFalse(urlList.contains("b.txt"));
+    }
+
+    // A commit_id that exists nowhere still fails (the JGit fetch error is unchanged).
+    @Test
+    public void test_storeData_unknownCommitIdKeepsExistingFailure() throws Exception {
+        final File remote = createTaggedRepo();
+
+        final DataStoreParams params = new DataStoreParams();
+        params.put("uri", remote.getAbsolutePath());
+        params.put("commit_id", "no-such-ref");
+
+        try {
+            newCollectingDataStore(new ArrayList<>()).storeData(null, null, params, null, null);
+            fail("Expected an exception");
+        } catch (final DataStoreException e) {
+            assertTrue(e.getCause().getMessage(), e.getCause().getMessage().contains("no-such-ref"));
+        }
+    }
+
     // Bug fix (fallback wiring): exercises the headRef == null branch of resolveDefaultBranch using a REAL
     // FetchResult from a real fetch against a remote that genuinely advertises no HEAD (see
     // createRepoWithUnadvertisedHead) -- the same "HEAD absent from the advertisement" shape a protocol-v2
