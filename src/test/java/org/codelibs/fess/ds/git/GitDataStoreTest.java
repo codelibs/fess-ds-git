@@ -142,7 +142,9 @@ public class GitDataStoreTest extends UnitDsTestCase {
             }
             git.add().addFilepattern(entry.getKey()).call();
         }
+        // Ignore the developer's global commit.gpgsign/gpg.format: JGit cannot sign with ssh keys.
         return git.commit()
+                .setSign(false)
                 .setMessage(message)
                 .setAuthor("Test Author", "author@example.com")
                 .setCommitter("Test Committer", "committer@example.com")
