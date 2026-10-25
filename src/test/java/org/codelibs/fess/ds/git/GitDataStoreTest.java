@@ -218,6 +218,44 @@ public class GitDataStoreTest extends UnitDsTestCase {
         assertTrue(urlList.contains("pom.xml"));
     }
 
+    /**
+     * Creates a bare repository whose pack carries a bitmap index ({@code *.bitmap}), which is what
+     * {@code git gc} leaves behind in a bare repository. Serving such a repository makes JGit read the bitmap
+     * index with {@code com.googlecode.javaewah}, an artifact that the shaded plugin jar has to bundle.
+     */
+    private File createBareRepoWithBitmapIndex(final Map<String, String> files) throws Exception {
+        final File source = createLocalRepo("main", files);
+        final File bare = Files.createTempDirectory("fess-ds-git-bitmap-").toFile();
+        tempDirs.add(bare);
+        try (Git git = Git.cloneRepository().setURI(source.getAbsolutePath()).setDirectory(bare).setBare(true).call()) {
+            git.gc().call();
+        }
+        final File[] bitmaps = new File(bare, "objects/pack").listFiles((dir, name) -> name.endsWith(".bitmap"));
+        assertNotNull(bitmaps);
+        assertTrue("fixture must contain a pack bitmap index", bitmaps.length > 0);
+        return bare;
+    }
+
+    // The shaded plugin jar must bundle JavaEWAH: without it, a bare repository with a pack bitmap index fails
+    // with "TransportException: remote: internal server error" (NoClassDefFoundError on the serving side).
+    // The unit-test classpath always has JavaEWAH, so this guards the crawl path; the bundling itself is
+    // enforced by the shade includes in pom.xml.
+    @Test
+    public void test_storeData_bareRepositoryWithBitmapIndex() throws Exception {
+        final Map<String, String> files = new LinkedHashMap<>();
+        files.put("README.md", "hello world");
+        files.put("pom.xml", "<project/>");
+        final File remote = createBareRepoWithBitmapIndex(files);
+
+        final DataStoreParams params = new DataStoreParams();
+        params.put("uri", remote.getAbsolutePath());
+        final List<String> urlList = new ArrayList<>();
+        newCollectingDataStore(urlList).storeData(null, null, params, null, null);
+
+        assertTrue(urlList.contains("README.md"));
+        assertTrue(urlList.contains("pom.xml"));
+    }
+
     /** Creates a local repo on branch "main" with two commits; returns [repoDir, firstCommitSha]. HEAD points at the second commit. */
     private String[] createTwoCommitRepo() throws Exception {
         final File dir = Files.createTempDirectory("fess-ds-git-src-").toFile();
