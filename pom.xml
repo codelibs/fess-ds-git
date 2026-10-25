@@ -19,6 +19,9 @@
 	</parent>
 	<properties>
 		<jgit.version>7.0.1.202505221510-r</jgit.version>
+		<!-- JGit needs it to read pack bitmap indexes, and the shade plugin bundles only the artifacts listed in
+		     its includes; keep in sync with the version JGit declares. -->
+		<javaewah.version>1.2.3</javaewah.version>
 	</properties>
 	<build>
 		<plugins>
@@ -49,6 +52,7 @@
 							<artifactSet>
 								<includes>
 									<include>org.eclipse.jgit:org.eclipse.jgit</include>
+									<include>com.googlecode.javaewah:JavaEWAH</include>
 								</includes>
 							</artifactSet>
 							<filters>
@@ -150,6 +154,11 @@
 			<groupId>org.eclipse.jgit</groupId>
 			<artifactId>org.eclipse.jgit</artifactId>
 			<version>${jgit.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>com.googlecode.javaewah</groupId>
+			<artifactId>JavaEWAH</artifactId>
+			<version>${javaewah.version}</version>
 		</dependency>
 		<dependency>
 			<groupId>org.slf4j</groupId>
