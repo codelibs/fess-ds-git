@@ -1234,6 +1234,11 @@ public class GitDataStore extends AbstractDataStore {
 
     /**
      * Returns the URL for the given path.
+     * <p>
+     * Only the characters that would change the structure of the URL are percent-encoded in the path:
+     * {@code %}, {@code #} and {@code ?}. A file name containing them would otherwise be read as an escape,
+     * a fragment or a query. Everything else, including {@code /}, spaces and non-ASCII characters, is left as is.
+     * The base URL is not modified.
      *
      * @param paramMap The parameter map.
      * @param path The path.
@@ -1242,9 +1247,37 @@ public class GitDataStore extends AbstractDataStore {
     protected String getUrl(final DataStoreParams paramMap, final String path) {
         final String baseUrl = paramMap.getAsString(BASE_URL);
         if (StringUtil.isNotBlank(baseUrl)) {
-            return baseUrl + path;
+            return baseUrl + encodePath(path);
         }
         return StringUtil.EMPTY;
+    }
+
+    /**
+     * Percent-encodes {@code %}, {@code #} and {@code ?} in the path in a single pass, so nothing is encoded twice.
+     *
+     * @param path The path.
+     * @return The path that is safe to append to the base URL.
+     */
+    protected String encodePath(final String path) {
+        final StringBuilder buf = new StringBuilder(path.length() + 8);
+        for (int i = 0; i < path.length(); i++) {
+            final char c = path.charAt(i);
+            switch (c) {
+            case '%':
+                buf.append("%25");
+                break;
+            case '#':
+                buf.append("%23");
+                break;
+            case '?':
+                buf.append("%3F");
+                break;
+            default:
+                buf.append(c);
+                break;
+            }
+        }
+        return buf.toString();
     }
 
     /**

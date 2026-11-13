@@ -94,6 +94,61 @@ public class GitDataStoreTest extends UnitDsTestCase {
         super.tearDown(testInfo);
     }
 
+    private String urlFor(final String baseUrl, final String path) {
+        final DataStoreParams params = new DataStoreParams();
+        if (baseUrl != null) {
+            params.put("base_url", baseUrl);
+        }
+        return new GitDataStore().getUrl(params, path);
+    }
+
+    @Test
+    public void test_getUrl_plainPathUnchanged() {
+        assertEquals("https://github.com/org/repo/blob/main/src/main/App.java",
+                urlFor("https://github.com/org/repo/blob/main/", "src/main/App.java"));
+    }
+
+    @Test
+    public void test_getUrl_spaceAndNonAsciiUnchanged() {
+        assertEquals("https://github.com/org/repo/blob/main/my docs/\u65e5\u672c\u8a9e.txt",
+                urlFor("https://github.com/org/repo/blob/main/", "my docs/\u65e5\u672c\u8a9e.txt"));
+    }
+
+    @Test
+    public void test_getUrl_percentIsEncoded() {
+        assertEquals("https://github.com/org/repo/blob/main/100%25.txt", urlFor("https://github.com/org/repo/blob/main/", "100%.txt"));
+    }
+
+    @Test
+    public void test_getUrl_hashIsEncoded() {
+        assertEquals("https://github.com/org/repo/blob/main/a%23b.txt", urlFor("https://github.com/org/repo/blob/main/", "a#b.txt"));
+    }
+
+    @Test
+    public void test_getUrl_questionMarkIsEncoded() {
+        assertEquals("https://github.com/org/repo/blob/main/a%3Fb.txt", urlFor("https://github.com/org/repo/blob/main/", "a?b.txt"));
+    }
+
+    @Test
+    public void test_getUrl_allReservedCharactersTogether() {
+        // '%' is encoded in the same pass, so the '%' of '%23' / '%3F' is never encoded again.
+        assertEquals("https://github.com/org/repo/blob/main/dir/50%25%23%3F.txt",
+                urlFor("https://github.com/org/repo/blob/main/", "dir/50%#?.txt"));
+    }
+
+    @Test
+    public void test_getUrl_slashIsPreserved() {
+        assertEquals("https://github.com/org/repo/blob/main/a/b%23c/d.txt",
+                urlFor("https://github.com/org/repo/blob/main/", "a/b#c/d.txt"));
+    }
+
+    @Test
+    public void test_getUrl_blankBaseUrlIsEmpty() {
+        assertEquals("", urlFor(null, "a#b.txt"));
+        assertEquals("", urlFor("", "a#b.txt"));
+        assertEquals("", urlFor("  ", "a#b.txt"));
+    }
+
     /**
      * Creates a local scratch Git repository with the given initial branch and file contents,
      * committing all files in a single commit. The returned directory can be used as a Git {@code uri}.
